@@ -1337,7 +1337,18 @@ def load_personal_wiki_tier1() -> Optional[str]:
     optional.
     """
     wiki_root = Path.home() / ".personal-wiki"
+    # Sentinel lives outside the wiki dir so it survives wiki deletion —
+    # that's the failure mode we want to catch (wiki existed before, gone now).
+    sentinel = Path.home() / ".hermes" / ".personal-wiki-was-present"
     if not wiki_root.exists():
+        if sentinel.exists():
+            logger.warning(
+                "personal-wiki missing at %s but sentinel %s exists — "
+                "tier-1 user context will be EMPTY for this session and any subagents. "
+                "Restore the wiki or remove the sentinel to silence this warning.",
+                wiki_root, sentinel,
+            )
+        # Fresh install (no sentinel) → silent. User hasn't built a wiki yet.
         return None
 
     sections: list[str] = []
@@ -1367,6 +1378,13 @@ def load_personal_wiki_tier1() -> Optional[str]:
 
     if not sections:
         return None
+
+    # Touch sentinel (idempotent) so future sessions can detect deletion.
+    try:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch(exist_ok=True)
+    except Exception as e:
+        logger.debug("Could not touch personal-wiki sentinel %s: %s", sentinel, e)
 
     header = (
         "# Personal Wiki (tier-1, always-load)\n\n"
