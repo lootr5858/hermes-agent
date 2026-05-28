@@ -97,6 +97,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # Personal wiki tier-1 (always-load identity/preferences/behavior).
+    # Independent of SOUL.md — wiki is canonical user context, SOUL is
+    # canonical agent persona. Loaded unconditionally when present so
+    # subagents that inherit the system prompt also see it.
+    try:
+        _wiki_content = _r.load_personal_wiki_tier1()
+        if _wiki_content:
+            stable_parts.append(_wiki_content)
+    except Exception:
+        pass
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 

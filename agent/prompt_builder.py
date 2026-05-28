@@ -1324,6 +1324,60 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+def load_personal_wiki_tier1() -> Optional[str]:
+    """Load ~/.personal-wiki/BOOTSTRAP.md + all ~/.personal-wiki/core/*.md.
+
+    Tier-1 ("always-load") slice of the user's personal-wiki. Injected
+    into the system prompt at session start so the agent (and any
+    subagents that inherit the prompt) always have canonical identity
+    + preferences in context, with no reliance on persona-directive
+    compliance.
+
+    Returns None if ~/.personal-wiki/ is missing or empty — wiki is
+    optional.
+    """
+    wiki_root = Path.home() / ".personal-wiki"
+    if not wiki_root.exists():
+        return None
+
+    sections: list[str] = []
+
+    bootstrap = wiki_root / "BOOTSTRAP.md"
+    if bootstrap.exists():
+        try:
+            content = bootstrap.read_text(encoding="utf-8").strip()
+            if content:
+                content = _scan_context_content(content, "personal-wiki/BOOTSTRAP.md")
+                sections.append(f"## personal-wiki/BOOTSTRAP.md\n\n{content}")
+        except Exception as e:
+            logger.debug("Could not read personal-wiki BOOTSTRAP.md: %s", e)
+
+    core_dir = wiki_root / "core"
+    if core_dir.is_dir():
+        for md_file in sorted(core_dir.glob("*.md")):
+            try:
+                content = md_file.read_text(encoding="utf-8").strip()
+                if not content:
+                    continue
+                rel = f"personal-wiki/core/{md_file.name}"
+                content = _scan_context_content(content, rel)
+                sections.append(f"## {rel}\n\n{content}")
+            except Exception as e:
+                logger.debug("Could not read %s: %s", md_file, e)
+
+    if not sections:
+        return None
+
+    header = (
+        "# Personal Wiki (tier-1, always-load)\n\n"
+        "Canonical user identity, preferences, and behavior rules. "
+        "Treat this as authoritative over memory entries when they conflict. "
+        "Full wiki lives at ~/.personal-wiki/.\n\n"
+    )
+    body = "\n\n".join(sections)
+    return _truncate_content(header + body, "personal-wiki tier-1")
+
+
 def _load_hermes_md(cwd_path: Path) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
