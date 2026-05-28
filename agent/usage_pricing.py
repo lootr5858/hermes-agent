@@ -253,6 +253,49 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # OpenAI
     (
         "openai",
+        "gpt-5.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("30.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
+        "gpt-5.5-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("30.00"),
+        output_cost_per_million=Decimal("180.00"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
+        "gpt-5.4",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.50"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.25"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
+        "gpt-5.4-mini",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
         "gpt-4o",
     ): PricingEntry(
         input_cost_per_million=Decimal("2.50"),
@@ -572,7 +615,7 @@ def resolve_billing_route(
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
-    if provider_name == "openai":
+    if provider_name in {"openai", "openai-api"}:
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")

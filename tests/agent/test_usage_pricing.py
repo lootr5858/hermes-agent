@@ -145,6 +145,49 @@ def test_estimate_usage_cost_marks_subscription_routes_included():
     assert float(result.amount_usd) == 0.0
 
 
+def test_openai_api_provider_uses_gpt_5_5_official_pricing():
+    entry = get_pricing_entry(
+        "gpt-5.5",
+        provider="openai-api",
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert entry.cache_read_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 5.0
+    assert float(entry.output_cost_per_million) == 30.0
+    assert float(entry.cache_read_cost_per_million) == 0.5
+
+
+def test_gpt_5_5_estimate_usage_cost_for_openai_api():
+    result = estimate_usage_cost(
+        "gpt-5.5",
+        CanonicalUsage(input_tokens=1000000, output_tokens=100000, cache_read_tokens=500000),
+        provider="openai-api",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M input × $5/M + 100K output × $30/M + 500K cached × $0.50/M = $8.25
+    assert float(result.amount_usd) == 8.25
+
+
+def test_gpt_5_4_mini_official_pricing_entry_exists():
+    entry = get_pricing_entry(
+        "gpt-5.4-mini",
+        provider="openai-api",
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert entry.cache_read_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 0.75
+    assert float(entry.output_cost_per_million) == 4.5
+    assert float(entry.cache_read_cost_per_million) == 0.075
+
+
 def test_estimate_usage_cost_refuses_cache_pricing_without_official_cache_rate(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",
