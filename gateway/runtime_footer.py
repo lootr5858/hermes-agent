@@ -32,6 +32,26 @@ _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
 
+def _format_tokens(n: int) -> str:
+    """Render a token count compactly: 850 → '850', 12345 → '12.3k', 1_234_567 → '1.2M'."""
+    if n < 1000:
+        return f"{n} tok"
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k tok"
+    return f"{n / 1_000_000:.2f}M tok"
+
+
+def _format_cost(usd: float) -> str:
+    """Render USD cost compactly: <$0.01 → '<$0.01', else '$0.04' or '$1.23'."""
+    if usd <= 0:
+        return ""
+    if usd < 0.01:
+        return "<$0.01"
+    if usd < 10:
+        return f"${usd:.2f}"
+    return f"${usd:.1f}"
+
+
 def _home_relative_cwd(cwd: str) -> str:
     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
     if not cwd:
@@ -94,6 +114,8 @@ def format_runtime_footer(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    total_tokens: int = 0,
+    cost_usd: float = 0.0,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -115,6 +137,13 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "tokens":
+            if total_tokens > 0:
+                parts.append(_format_tokens(total_tokens))
+        elif field == "cost":
+            c = _format_cost(cost_usd)
+            if c:
+                parts.append(c)
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -130,6 +159,8 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    total_tokens: int = 0,
+    cost_usd: float = 0.0,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -145,5 +176,7 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        total_tokens=total_tokens,
+        cost_usd=cost_usd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
