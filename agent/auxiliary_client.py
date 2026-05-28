@@ -5399,6 +5399,14 @@ async def async_call_llm(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    if task:
+        logger.info(
+            "Auxiliary %s (async): using %s (%s)%s",
+            task,
+            resolved_provider or "auto",
+            final_model or "default",
+            f" at {_client_base}" if _client_base and "openrouter" not in _client_base else "",
+        )
     kwargs = _build_call_kwargs(
         resolved_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
