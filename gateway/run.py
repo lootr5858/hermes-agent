@@ -9146,6 +9146,8 @@ class GatewayRunner:
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     total_tokens=agent_result.get("total_tokens", 0) or 0,
+                    input_tokens=agent_result.get("input_tokens", 0) or 0,
+                    output_tokens=agent_result.get("output_tokens", 0) or 0,
                     cost_usd=float(agent_result.get("estimated_cost_usd") or 0.0),
                 )
                 logger.info("runtime_footer: line=%r already_sent=%s resp_len=%d platform=%s",

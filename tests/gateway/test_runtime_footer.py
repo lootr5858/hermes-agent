@@ -115,6 +115,26 @@ def test_format_footer_empty_fields_returns_empty():
     assert out == ""
 
 
+def test_format_footer_tokens_io_renders_compact_split(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    out = format_runtime_footer(
+        model="claude-haiku-4-5-20251001",
+        context_tokens=24000, context_length=200000,
+        cwd="", total_tokens=91900, input_tokens=80000, output_tokens=12000,
+        fields=("model", "context_pct", "tokens_io"),
+    )
+    assert out == "claude-haiku-4-5-20251001 · 12% · 80.0k/12.0k"
+
+
+def test_format_footer_tokens_io_skipped_when_zero():
+    out = format_runtime_footer(
+        model="m", context_tokens=0, context_length=100,
+        input_tokens=0, output_tokens=0,
+        fields=("tokens_io",),
+    )
+    assert out == ""
+
+
 def test_format_footer_drops_cwd_when_empty(monkeypatch):
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     out = format_runtime_footer(

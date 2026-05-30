@@ -32,13 +32,25 @@ _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
 
-def _format_tokens(n: int) -> str:
-    """Render a token count compactly: 850 → '850', 12345 → '12.3k', 1_234_567 → '1.2M'."""
+def _format_token_count(n: int) -> str:
+    """Render a token count compactly, no unit: 850 → '850', 12345 → '12.3k', 1_234_567 → '1.2M'."""
     if n < 1000:
-        return f"{n} tok"
+        return f"{n}"
     if n < 1_000_000:
-        return f"{n / 1000:.1f}k tok"
-    return f"{n / 1_000_000:.2f}M tok"
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.2f}M"
+
+
+def _format_tokens(n: int) -> str:
+    """Render a total token count with unit: 850 → '850 tok', 12345 → '12.3k tok'."""
+    return f"{_format_token_count(n)} tok"
+
+
+def _format_tokens_io(input_tokens: int, output_tokens: int) -> str:
+    """Render input/output token counts as 'in/out' (no unit): 80000,12000 → '80.0k/12.0k'."""
+    if input_tokens <= 0 and output_tokens <= 0:
+        return ""
+    return f"{_format_token_count(input_tokens)}/{_format_token_count(output_tokens)}"
 
 
 def _format_cost(usd: float) -> str:
@@ -115,6 +127,8 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     total_tokens: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
     cost_usd: float = 0.0,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
@@ -140,6 +154,10 @@ def format_runtime_footer(
         elif field == "tokens":
             if total_tokens > 0:
                 parts.append(_format_tokens(total_tokens))
+        elif field == "tokens_io":
+            io = _format_tokens_io(input_tokens, output_tokens)
+            if io:
+                parts.append(io)
         elif field == "cost":
             c = _format_cost(cost_usd)
             if c:
@@ -160,6 +178,8 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     total_tokens: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
     cost_usd: float = 0.0,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
@@ -177,6 +197,8 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         cost_usd=cost_usd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
