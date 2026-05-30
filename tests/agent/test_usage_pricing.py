@@ -267,3 +267,29 @@ def test_deepseek_v4_pro_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
     assert float(result.amount_usd) == 3.48
+
+
+def test_anthropic_dated_snapshot_resolves_to_undated_pricing():
+    """A dated model id (e.g. ...-20251001) with no explicit dated table entry
+    falls back to its undated pricing instead of returning unknown."""
+    dated = get_pricing_entry("claude-haiku-4-5-20251001", provider="anthropic")
+    undated = get_pricing_entry("claude-haiku-4-5", provider="anthropic")
+
+    assert dated is not None
+    assert undated is not None
+    assert float(dated.input_cost_per_million) == float(undated.input_cost_per_million)
+    assert float(dated.output_cost_per_million) == float(undated.output_cost_per_million)
+
+
+def test_anthropic_dated_snapshot_estimate_usage_cost():
+    """The dated haiku 4.5 id used by the Anthropic API yields a dollar estimate."""
+    result = estimate_usage_cost(
+        "claude-haiku-4-5-20251001",
+        CanonicalUsage(input_tokens=80000, output_tokens=12000),
+        provider="anthropic",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 80K input × $1/M + 12K output × $5/M = $0.08 + $0.06 = $0.14
+    assert float(result.amount_usd) == 0.14

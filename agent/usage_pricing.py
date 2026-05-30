@@ -641,19 +641,31 @@ def _normalize_anthropic_model_name(model: str) -> str:
     return name
 
 
+# Trailing Anthropic snapshot date, e.g. "claude-haiku-4-5-20251001" → "-20251001".
+_DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+
+
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
     model = route.model.lower()
     # Direct lookup first
     entry = _OFFICIAL_DOCS_PRICING.get((route.provider, model))
     if entry:
         return entry
-    # Try normalized name for Anthropic (handles dot-notation like opus-4.7)
+    # Anthropic fallbacks: dot-notation (opus-4.7) and trailing snapshot dates
+    # (e.g. claude-haiku-4-5-20251001) that lack an explicit dated table entry.
     if route.provider == "anthropic":
+        seen = {model}
         normalized = _normalize_anthropic_model_name(model)
-        if normalized != model:
-            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
-            if entry:
-                return entry
+        for cand in (
+            normalized,
+            _DATE_SUFFIX_RE.sub("", model),
+            _DATE_SUFFIX_RE.sub("", normalized),
+        ):
+            if cand and cand not in seen:
+                seen.add(cand)
+                entry = _OFFICIAL_DOCS_PRICING.get((route.provider, cand))
+                if entry:
+                    return entry
     return None
 
 
