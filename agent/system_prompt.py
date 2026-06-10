@@ -97,16 +97,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Personal wiki tier-1 (always-load identity/preferences/behavior).
-    # Independent of SOUL.md — wiki is canonical user context, SOUL is
-    # canonical agent persona. Loaded unconditionally when present so
-    # subagents that inherit the system prompt also see it.
-    try:
-        _wiki_content = _r.load_personal_wiki_tier1()
-        if _wiki_content:
-            stable_parts.append(_wiki_content)
-    except Exception:
-        pass
+    # Personal wiki tier-1 (identity/preferences/behavior) — FALLBACK for when
+    # the personal-wiki memory provider isn't actively hydrating: skip_memory
+    # contexts (crons, subagents, batch/review forks — no _memory_manager) AND
+    # the provider-configured-but-unavailable case (manager present, no
+    # providers, e.g. token missing). The main agent gets tier-1 from the
+    # provider (system_prompt_block, volatile tier); gating on active providers
+    # avoids double-injection there.
+    if not (getattr(agent, "_memory_manager", None) and agent._memory_manager.providers):
+        try:
+            _wiki_content = _r.load_personal_wiki_tier1()
+            if _wiki_content:
+                stable_parts.append(_wiki_content)
+        except Exception:
+            pass
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
