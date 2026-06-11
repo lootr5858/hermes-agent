@@ -1643,6 +1643,13 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
             await self._app.start()
 
+            # Dispatch handoff poller — surface pending Agent→Claude Code handoffs
+            # (serve/dispatch-mcp store) as tap-to-approve buttons. Zero LLM.
+            try:
+                self._dispatch_task = asyncio.create_task(self._dispatch_poll_loop())
+            except Exception as _disp_exc:
+                logger.warning("[%s] could not start dispatch poller: %s", self.name, _disp_exc)
+
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 
@@ -1789,6 +1796,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        _disp_task = getattr(self, "_dispatch_task", None)
+        if _disp_task and not _disp_task.done():
+            _disp_task.cancel()
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -3229,6 +3239,92 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    # ── Dispatch handoff buttons (Agent→Claude Code; serve/dispatch-mcp) ──────
+    _DISPATCH_DIR = "/home/evanlinux/.personal-wiki/serve/dispatch-mcp"
+    _NODE_BIN = "/home/evanlinux/.local/bin/node"
+
+    async def _dispatch_cli(self, *args: str) -> str:
+        """Run serve/dispatch-mcp/cli.mjs <args>; return stdout (or stderr)."""
+        proc = await asyncio.create_subprocess_exec(
+            self._NODE_BIN, "--disable-warning=ExperimentalWarning",
+            f"{self._DISPATCH_DIR}/cli.mjs", *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        return (out.decode().strip() or err.decode().strip())
+
+    async def _surface_pending_handoffs(self) -> None:
+        """Push a tap-to-approve button per pending handoff, then mark it notified."""
+        if not self._bot:
+            return
+        raw = await self._dispatch_cli("list-pending")
+        try:
+            rows = json.loads(raw) if raw else []
+        except Exception:
+            return
+        if not rows:
+            return
+        try:
+            chat_id = int(os.getenv("DISPATCH_CHAT_ID", "331302176"))
+        except ValueError:
+            return
+        for r in rows:
+            hid = r.get("id")
+            if not hid:
+                continue
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve", callback_data=f"disp:a:{hid}"),
+                InlineKeyboardButton("✖ Skip", callback_data=f"disp:s:{hid}"),
+            ]])
+            text = (
+                f"📨 Handoff — {r.get('title', '')}\n"
+                f"target: {r.get('target_dir', '')}\n"
+                f"from: {r.get('source', '')}"
+            )
+            try:
+                await self._bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+                await self._dispatch_cli("mark-notified", hid)
+            except Exception as exc:
+                logger.warning("[Telegram] failed to surface handoff %s: %s", hid, exc)
+
+    async def _dispatch_poll_loop(self) -> None:
+        """Background loop: surface pending dispatch handoffs every ~2 min (zero LLM)."""
+        await asyncio.sleep(20)  # let the gateway settle after start
+        while True:
+            try:
+                await self._surface_pending_handoffs()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[Telegram] dispatch poll error: %s", exc)
+            await asyncio.sleep(120)
+
+    async def _run_dispatch_seed(self, chat_id: Optional[str], handoff_id: str) -> None:
+        """Run the plan-mode seed for an approved handoff; send Evan the resume command."""
+        text = "dispatch seed produced no output"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._NODE_BIN, "--disable-warning=ExperimentalWarning",
+                f"{self._DISPATCH_DIR}/seed.mjs", handoff_id,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout=400)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                out, err = b"", b"seed timed out (>400s)"
+            text = (out.decode().strip() or err.decode().strip() or text)
+        except Exception as exc:
+            text = f"dispatch seed failed: {exc}"
+        try:
+            if self._bot and chat_id is not None:
+                await self._bot.send_message(chat_id=int(chat_id), text=text)
+        except Exception as exc:
+            logger.warning("[Telegram] failed to send dispatch resume command: %s", exc)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3261,6 +3357,50 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Dispatch handoff callbacks (disp:a:<id> approve / disp:s:<id> skip) ---
+        if data.startswith("disp:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                verb, handoff_id = parts[1], parts[2]
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ Not authorized.")
+                    return
+                user_display = getattr(query.from_user, "first_name", "User")
+                if verb == "s":
+                    try:
+                        await self._dispatch_cli("mark-declined", handoff_id)
+                    except Exception as exc:
+                        logger.warning("[Telegram] dispatch decline failed: %s", exc)
+                    await query.answer(text="✖ Skipped")
+                    try:
+                        await query.edit_message_text(
+                            text=self.format_message(f"✖ Handoff skipped by {user_display}"),
+                            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+                if verb == "a":
+                    await query.answer(text="⏳ Seeding…")
+                    try:
+                        await query.edit_message_text(
+                            text=self.format_message(f"⏳ Seeding {handoff_id} — resume command coming…"),
+                            parse_mode=ParseMode.MARKDOWN_V2, reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    asyncio.create_task(self._run_dispatch_seed(query_chat_id, handoff_id))
+                    return
+            await query.answer()
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
