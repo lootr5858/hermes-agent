@@ -108,10 +108,12 @@ If you're trying to switch to a provider you haven't set up yet (e.g. you only h
 
 Use Claude models directly through the Anthropic API — no OpenRouter proxy needed. Supports three auth methods:
 
-:::caution Requires Claude Max "extra usage" credits
-When you authenticate via `hermes model` → Anthropic OAuth (or via `hermes auth add anthropic --type oauth`), Hermes routes as Claude Code against your Anthropic account. **It only works if you're on a Claude Max plan and have purchased extra usage credits.** The base Max plan allowance (the usage included in Claude Code by default) is not consumed by Hermes — only the extra/overage credits you've added on top are. Claude Pro subscribers cannot use this path.
+:::caution Subscription OAuth is strict but Anthropic controls final routing
+When you authenticate via `hermes model` → Anthropic OAuth, Hermes stores `model.auth_mode: subscription_only`. In this mode Hermes ignores `ANTHROPIC_API_KEY`, `ANTHROPIC_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and Anthropic credential-pool entries, then uses only refreshable Claude Code OAuth credentials from your Claude Pro/Max login.
 
-If you don't have Max + extra credits, use an `ANTHROPIC_API_KEY` instead — requests are billed pay-per-token against that key's organization (standard API pricing, independent of any Claude subscription).
+This prevents local fallback to API-key billing or legacy extra-usage tokens. Anthropic's backend may still classify unapproved third-party OAuth clients as extra-usage clients and return a 400 such as "Third-party apps now draw from your extra usage..." If that happens, Hermes reports the auth mode/source so you can distinguish Anthropic-side routing from local credential fallback.
+
+If you intentionally want pay-per-token billing, use an `ANTHROPIC_API_KEY` and leave `model.auth_mode` unset or set to `api_key`.
 :::
 
 ```bash
@@ -122,6 +124,10 @@ hermes chat --provider anthropic --model claude-sonnet-4-6
 # Preferred: authenticate through `hermes model`
 # Hermes will use Claude Code's credential store directly when available
 hermes model
+
+# Manual equivalent for subscription-only Claude usage
+hermes config set model.provider anthropic
+hermes config set model.auth_mode subscription_only
 
 # Manual override with a setup-token (fallback / legacy)
 export ANTHROPIC_TOKEN=***  # setup-token or manual OAuth token

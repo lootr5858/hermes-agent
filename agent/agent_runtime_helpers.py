@@ -607,6 +607,15 @@ def recover_with_credential_pool(
     if pool is None:
         return False, has_retried_429
 
+    if (
+        (getattr(agent, "provider", "") or "").strip().lower() == "anthropic"
+        and getattr(agent, "_anthropic_auth_mode", "") == "subscription_only"
+    ):
+        logger.info(
+            "Anthropic subscription_only mode active — skipping credential-pool recovery"
+        )
+        return False, has_retried_429
+
     # Defensive guard: if a fallback provider is active and its provider name
     # doesn't match the pool's provider, the pool belongs to the PRIMARY
     # provider.  Mutating it based on fallback errors would corrupt the
@@ -855,6 +864,9 @@ def try_recover_primary_transport(
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
+            agent._anthropic_auth_mode = rt.get("anthropic_auth_mode", "default")
+            agent._anthropic_auth_source = rt.get("anthropic_auth_source", "")
+            agent._anthropic_auth_ignored_sources = tuple(rt.get("anthropic_auth_ignored_sources", ()) or ())
             agent.client = None
         else:
             agent.client = agent._create_openai_client(
@@ -1027,6 +1039,9 @@ def restore_primary_runtime(agent) -> bool:
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
+            agent._anthropic_auth_mode = rt.get("anthropic_auth_mode", "default")
+            agent._anthropic_auth_source = rt.get("anthropic_auth_source", "")
+            agent._anthropic_auth_ignored_sources = tuple(rt.get("anthropic_auth_ignored_sources", ()) or ())
             agent.client = None
         else:
             agent.client = agent._create_openai_client(
@@ -1504,6 +1519,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_api_key",
             "_anthropic_base_url",
             "_is_anthropic_oauth",
+            "_anthropic_auth_mode",
+            "_anthropic_auth_source",
+            "_anthropic_auth_ignored_sources",
             "_config_context_length",
         )
     }
@@ -1538,14 +1556,29 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         if api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
+                get_configured_anthropic_auth_mode,
+                resolve_anthropic_credentials,
                 resolve_anthropic_token,
+                _is_third_party_anthropic_endpoint,
                 _is_oauth_token,
             )
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
             # API key — falling back would send Anthropic credentials to third-party endpoints.
-            _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+            _is_native_anthropic = (
+                new_provider == "anthropic"
+                and not _is_third_party_anthropic_endpoint(base_url)
+            )
+            _anthropic_creds = None
+            if _is_native_anthropic:
+                _auth_mode = get_configured_anthropic_auth_mode()
+                if _auth_mode == "subscription_only":
+                    _anthropic_creds = resolve_anthropic_credentials(auth_mode=_auth_mode)
+                    effective_key = _anthropic_creds.token or ""
+                else:
+                    effective_key = api_key or agent.api_key or resolve_anthropic_token() or ""
+            else:
+                effective_key = api_key or agent.api_key or ""
 
             # MiniMax OAuth: swap static string for a per-request callable token
             # provider so the rebuilt client survives 15-min token expiry. See
@@ -1565,6 +1598,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
+            if _anthropic_creds is not None:
+                agent._anthropic_auth_mode = _anthropic_creds.auth_mode
+                agent._anthropic_auth_source = _anthropic_creds.source
+                agent._anthropic_auth_ignored_sources = tuple(_anthropic_creds.ignored_sources)
+            elif _is_native_anthropic:
+                agent._anthropic_auth_mode = "default"
+                agent._anthropic_auth_source = "legacy_resolution"
+                agent._anthropic_auth_ignored_sources = ()
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url,
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
@@ -1679,6 +1720,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "anthropic_api_key": agent._anthropic_api_key,
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
+            "anthropic_auth_mode": getattr(agent, "_anthropic_auth_mode", "default"),
+            "anthropic_auth_source": getattr(agent, "_anthropic_auth_source", ""),
+            "anthropic_auth_ignored_sources": tuple(getattr(agent, "_anthropic_auth_ignored_sources", ()) or ()),
         })
 
     # ── Reset fallback state ──

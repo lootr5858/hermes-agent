@@ -2140,25 +2140,17 @@ def _try_azure_foundry(
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import (
+            ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+            build_anthropic_client,
+            get_configured_anthropic_auth_mode,
+            resolve_anthropic_credentials,
+            resolve_anthropic_token,
+        )
     except ImportError:
         return None, None
 
-    pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present:
-        if entry is None:
-            return None, None
-        token = explicit_api_key or _pool_runtime_api_key(entry)
-    else:
-        entry = None
-        token = explicit_api_key or resolve_anthropic_token()
-    if not token:
-        return None, None
-
-    # Allow base URL override from config.yaml model.base_url, but only
-    # when the configured provider is anthropic — otherwise a non-Anthropic
-    # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
-    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    configured_base_url = _ANTHROPIC_DEFAULT_BASE_URL
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -2168,9 +2160,37 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
             if cfg_provider == "anthropic":
                 cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
                 if cfg_base_url:
-                    base_url = cfg_base_url
+                    configured_base_url = cfg_base_url
     except Exception:
         pass
+
+    auth_mode = get_configured_anthropic_auth_mode()
+    is_direct_anthropic = "anthropic.com" in configured_base_url.lower()
+    if auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY and is_direct_anthropic:
+        pool_present = False
+        entry = None
+        try:
+            token = resolve_anthropic_credentials(auth_mode=auth_mode).token
+        except Exception as exc:
+            logger.debug("Auxiliary client: Anthropic subscription_only auth unavailable: %s", exc)
+            return None, None
+    else:
+        pool_present, entry = _select_pool_entry("anthropic")
+        token = ""
+    if pool_present:
+        if entry is None:
+            return None, None
+        token = explicit_api_key or _pool_runtime_api_key(entry)
+    elif auth_mode != ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY or not is_direct_anthropic:
+        entry = None
+        token = explicit_api_key or resolve_anthropic_token()
+    if not token:
+        return None, None
+
+    # Allow base URL override from config.yaml model.base_url, but only
+    # when the configured provider is anthropic — otherwise a non-Anthropic
+    # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
+    base_url = _pool_runtime_base_url(entry, configured_base_url) if pool_present else configured_base_url
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
@@ -2913,12 +2933,22 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "anthropic":
-            from agent.anthropic_adapter import read_claude_code_credentials, _refresh_oauth_token, resolve_anthropic_token
+            from agent.anthropic_adapter import (
+                ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+                get_configured_anthropic_auth_mode,
+                read_claude_code_credentials,
+                resolve_anthropic_credentials,
+                _refresh_oauth_token,
+                resolve_anthropic_token,
+            )
 
-            creds = read_claude_code_credentials()
-            token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None
-            if not str(token or "").strip():
-                token = resolve_anthropic_token()
+            if get_configured_anthropic_auth_mode() == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+                token = resolve_anthropic_credentials(auth_mode=ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY).token
+            else:
+                creds = read_claude_code_credentials()
+                token = _refresh_oauth_token(creds) if isinstance(creds, dict) and creds.get("refreshToken") else None
+                if not str(token or "").strip():
+                    token = resolve_anthropic_token()
             if not str(token or "").strip():
                 return False
             _evict_cached_clients(normalized)

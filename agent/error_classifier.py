@@ -57,6 +57,7 @@ class FailoverReason(enum.Enum):
     # Provider-specific
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
+    anthropic_third_party_extra_usage = "anthropic_third_party_extra_usage"  # Anthropic routed OAuth third-party app to extra usage
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
 
@@ -592,6 +593,24 @@ def classify_api_error(
             FailoverReason.long_context_tier,
             retryable=True,
             should_compress=True,
+        )
+
+    # Anthropic third-party OAuth extra-usage routing gate. This is distinct
+    # from the 429 long-context tier gate above: Anthropic returns it as HTTP
+    # 400 with wording such as "Third-party apps now draw from your extra
+    # usage, not your plan limits."  Retrying or compressing will not change
+    # the account-route decision; surface/fallback immediately.
+    if (
+        status_code == 400
+        and "third-party apps" in error_msg
+        and "extra usage" in error_msg
+        and "plan limits" in error_msg
+    ):
+        return _result(
+            FailoverReason.anthropic_third_party_extra_usage,
+            retryable=False,
+            should_compress=False,
+            should_fallback=True,
         )
 
     # Anthropic OAuth subscription rejects the 1M-context beta header.

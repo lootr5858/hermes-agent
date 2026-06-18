@@ -18,6 +18,7 @@ import platform
 import secrets
 import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -54,6 +55,28 @@ def _get_anthropic_sdk():
     return _anthropic_sdk
 
 logger = logging.getLogger(__name__)
+
+ANTHROPIC_AUTH_MODE_DEFAULT = "default"
+ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY = "subscription_only"
+_ANTHROPIC_SUBSCRIPTION_IGNORED_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+class AnthropicAuthError(RuntimeError):
+    """Raised when the selected Anthropic auth mode cannot be satisfied."""
+
+
+@dataclass(frozen=True)
+class AnthropicCredentials:
+    token: Any
+    source: str
+    auth_mode: str = ANTHROPIC_AUTH_MODE_DEFAULT
+    is_oauth: bool = False
+    ignored_sources: Tuple[str, ...] = ()
+
 
 THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
@@ -908,6 +931,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
                 "accessToken": access_token,
                 "refreshToken": oauth_data.get("refreshToken", ""),
                 "expiresAt": oauth_data.get("expiresAt", 0),
+                "scopes": oauth_data.get("scopes", []),
                 "source": "macos_keychain",
             }
 
@@ -946,6 +970,7 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
                         "accessToken": access_token,
                         "refreshToken": oauth_data.get("refreshToken", ""),
                         "expiresAt": oauth_data.get("expiresAt", 0),
+                        "scopes": oauth_data.get("scopes", []),
                         "source": "claude_code_credentials_file",
                     }
         except (json.JSONDecodeError, OSError, IOError) as e:
@@ -1159,8 +1184,126 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
-def resolve_anthropic_token() -> Optional[str]:
-    """Resolve an Anthropic token from all available sources.
+def normalize_anthropic_auth_mode(value: Any = None) -> str:
+    """Normalize user-facing Anthropic auth mode strings."""
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw in {"", "auto", "default"}:
+        return ANTHROPIC_AUTH_MODE_DEFAULT
+    if raw in {
+        "subscription",
+        "subscription_only",
+        "claude_code",
+        "claude_code_oauth",
+        "claude_code_subscription",
+        "claude_subscription",
+        "pro_max",
+        "pro_max_subscription",
+    }:
+        return ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY
+    if raw in {"api_key", "api"}:
+        return ANTHROPIC_AUTH_MODE_DEFAULT
+    logger.warning("Unknown Anthropic auth_mode %r; using default resolution", value)
+    return ANTHROPIC_AUTH_MODE_DEFAULT
+
+
+def get_configured_anthropic_auth_mode(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return the configured native Anthropic auth mode.
+
+    ``model.auth_mode`` is the primary knob.  ``providers.anthropic.auth_mode``
+    is accepted for users who prefer provider-scoped config.
+    """
+    raw = None
+    if isinstance(model_cfg, dict):
+        raw = model_cfg.get("auth_mode") or model_cfg.get("anthropic_auth_mode")
+    if raw is None:
+        try:
+            cfg = config
+            if cfg is None:
+                from hermes_cli.config import load_config
+                cfg = load_config()
+            if isinstance(cfg, dict):
+                model = cfg.get("model")
+                if isinstance(model, dict):
+                    raw = model.get("auth_mode") or model.get("anthropic_auth_mode")
+                if raw is None:
+                    providers = cfg.get("providers")
+                    if isinstance(providers, dict):
+                        anthropic_cfg = providers.get("anthropic")
+                        if isinstance(anthropic_cfg, dict):
+                            raw = anthropic_cfg.get("auth_mode")
+        except Exception as exc:
+            logger.debug("Failed to read Anthropic auth_mode from config: %s", exc)
+    return normalize_anthropic_auth_mode(raw)
+
+
+def _credential_scopes(creds: Dict[str, Any]) -> set[str]:
+    raw = creds.get("scopes", [])
+    if isinstance(raw, str):
+        return {part.strip() for part in raw.replace(",", " ").split() if part.strip()}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(part).strip() for part in raw if str(part).strip()}
+    return set()
+
+
+def _ignored_subscription_env_sources() -> Tuple[str, ...]:
+    ignored = []
+    for name in _ANTHROPIC_SUBSCRIPTION_IGNORED_ENV_VARS:
+        if os.getenv(name, "").strip():
+            ignored.append(name)
+    return tuple(ignored)
+
+
+def resolve_anthropic_subscription_credentials() -> AnthropicCredentials:
+    """Resolve Claude subscription credentials and fail closed on ambiguity.
+
+    Subscription-only mode intentionally ignores all Anthropic env tokens and
+    API keys.  The only accepted credential is refreshable Claude Code OAuth
+    from ``~/.claude/.credentials.json`` or the platform keychain.
+    """
+    ignored = _ignored_subscription_env_sources()
+    creds = read_claude_code_credentials()
+    if not isinstance(creds, dict) or not str(creds.get("accessToken") or "").strip():
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode requires Claude Code OAuth credentials. "
+            "Run `claude /login` with your Claude Pro/Max account, then retry. "
+            "ANTHROPIC_API_KEY, ANTHROPIC_TOKEN, and CLAUDE_CODE_OAUTH_TOKEN are "
+            "ignored in this mode."
+        )
+    if not str(creds.get("refreshToken") or "").strip():
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode requires refreshable Claude Code OAuth "
+            "credentials, but the detected credential has no refresh token. "
+            "Run `claude /login` again."
+        )
+    scopes = _credential_scopes(creds)
+    if "user:inference" not in scopes:
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode requires Claude Code OAuth scope "
+            "`user:inference`. Run `claude /login` again to refresh the credential."
+        )
+
+    token = _resolve_claude_code_token_from_credentials(creds)
+    if not str(token or "").strip():
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode could not resolve a valid Claude Code "
+            "OAuth access token. Run `claude /login` again."
+        )
+
+    return AnthropicCredentials(
+        token=token,
+        source=str(creds.get("source") or "claude_code_credentials"),
+        auth_mode=ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+        is_oauth=True,
+        ignored_sources=ignored,
+    )
+
+
+def _resolve_anthropic_token_default() -> Optional[str]:
+    """Resolve an Anthropic token using the legacy compatibility chain.
 
     Priority:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
@@ -1201,6 +1344,45 @@ def resolve_anthropic_token() -> Optional[str]:
         return api_key
 
     return None
+
+
+def resolve_anthropic_credentials(
+    *,
+    auth_mode: Optional[str] = None,
+    explicit_api_key: Any = None,
+) -> AnthropicCredentials:
+    """Resolve native Anthropic credentials with source metadata."""
+    mode = normalize_anthropic_auth_mode(auth_mode)
+    if mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+        return resolve_anthropic_subscription_credentials()
+
+    if explicit_api_key:
+        return AnthropicCredentials(
+            token=explicit_api_key,
+            source="explicit",
+            auth_mode=ANTHROPIC_AUTH_MODE_DEFAULT,
+            is_oauth=_is_oauth_token(explicit_api_key) if isinstance(explicit_api_key, str) else False,
+        )
+
+    token = _resolve_anthropic_token_default()
+    return AnthropicCredentials(
+        token=token or "",
+        source="legacy_resolution" if token else "missing",
+        auth_mode=ANTHROPIC_AUTH_MODE_DEFAULT,
+        is_oauth=_is_oauth_token(token) if isinstance(token, str) else False,
+    )
+
+
+def resolve_anthropic_token(*, auth_mode: Optional[str] = None) -> Optional[str]:
+    """Resolve an Anthropic token from the selected auth mode.
+
+    In ``subscription_only`` mode this raises :class:`AnthropicAuthError` instead
+    of falling back to env API keys/tokens.
+    """
+    mode = normalize_anthropic_auth_mode(auth_mode)
+    if mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+        return str(resolve_anthropic_subscription_credentials().token or "")
+    return _resolve_anthropic_token_default()
 
 
 def run_oauth_setup_token() -> Optional[str]:
