@@ -96,3 +96,51 @@ def test_runtime_provider_subscription_only_bypasses_anthropic_pool(monkeypatch)
     assert resolved["api_key"] == "sk-ant-oauth-file-token"
     assert resolved["auth_mode"] == "subscription_only"
     assert resolved["auth_source"] == "claude_code_credentials_file"
+
+
+def test_oauth_kwargs_include_claude_code_billing_marker(monkeypatch):
+    monkeypatch.setattr(aa, "_get_claude_code_version", lambda: "2.1.168")
+
+    kwargs = aa.build_anthropic_kwargs(
+        model="claude-sonnet-4-6",
+        messages=[
+            {"role": "system", "content": "Hermes Agent system prompt"},
+            {"role": "user", "content": "hi"},
+        ],
+        tools=None,
+        max_tokens=32,
+        reasoning_config=None,
+        is_oauth=True,
+    )
+
+    system = kwargs["system"]
+    assert system[0] == {
+        "type": "text",
+        "text": (
+            "x-anthropic-billing-header: "
+            "cc_version=2.1.168; cc_entrypoint=sdk-cli; cch=00000;"
+        ),
+    }
+    assert system[1] == {
+        "type": "text",
+        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+    }
+    assert system[2] == {"type": "text", "text": "Claude Code system prompt"}
+
+
+def test_non_oauth_kwargs_do_not_include_claude_code_billing_marker(monkeypatch):
+    monkeypatch.setattr(aa, "_get_claude_code_version", lambda: "2.1.168")
+
+    kwargs = aa.build_anthropic_kwargs(
+        model="claude-sonnet-4-6",
+        messages=[
+            {"role": "system", "content": "Hermes Agent system prompt"},
+            {"role": "user", "content": "hi"},
+        ],
+        tools=None,
+        max_tokens=32,
+        reasoning_config=None,
+        is_oauth=False,
+    )
+
+    assert kwargs["system"] == "Hermes Agent system prompt"
