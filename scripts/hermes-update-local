@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# hermes-update-local (v2) — conflict-safe updater for a custom Hermes fork.
+#
+# Guarantees the live checkout is ALWAYS left on a branch that imports cleanly:
+# either a validated `local/working` or clean `main`. Never a half-merged state.
+#
+# Strategy (see also the matching memory note):
+#   1. Sync official: fetch upstream (Nous), fast-forward main, push the fork mirror.
+#   2. Build a candidate `local/working` in an isolated git worktree, merging each
+#      feature branch one at a time. git rerere auto-resolves known conflicts.
+#   3. Drop ONLY features that conflict (rerere can't resolve) or fail validation;
+#      keep every feature that merges cleanly and still imports.
+#   4. Validate via a Python import smoke test (catches the "textually clean but
+#      broken" merge that a plain git merge would miss).
+#   5. Publish atomically, or fall back to plain main. Always end runnable.
+#
+# Usage:
+#   hermes-update-local                    # perform the update
+#   hermes-update-local --dry-run          # show what WOULD happen; no live changes
+#   hermes-update-local --teach <branch>   # prime rerere for a conflicting feature
+#
+# Add/remove your per-function branches via the features config (one branch per
+# line, merge order). Append "  !required" to a branch line to make its loss
+# (conflict / broken import / missing) ABORT the publish instead of silently
+# dropping it — the live checkout is then left untouched. Do NOT rebase feature
+# branches here — they are stable sources; only `working` is regenerated.
+
+set -euo pipefail
+
+# ── Config ───────────────────────────────────────────────────────────────────
+REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
+UPSTREAM_REMOTE="upstream"          # NousResearch (fetch-only)
+ORIGIN_REMOTE="origin"             # your fork (push)
+MAIN_BRANCH="main"
+WORKING_BRANCH="local/working"
+VENV_PY="$REPO/venv/bin/python"
+
+# Per-function feature branches are read from a self-documenting config file
+# (one branch per line, in merge order). Edit THAT file to add/remove features —
+# no need to touch this script. Override the path with $HERMES_FEATURES_CONF.
+FEATURES_CONF="${HERMES_FEATURES_CONF:-$HOME/.hermes/hermes-features.conf}"
+FEATURE_BRANCHES=()
+declare -A REQUIRED=()   # branch -> 1 when annotated "!required" in the conf
+
+# Files whose change implies a dependency reinstall is needed.
+DEP_FILES=(pyproject.toml setup.py setup.cfg requirements.txt uv.lock poetry.lock)
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+c_blue=$'\033[34m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+say()  { printf '%s→%s %s\n' "$c_blue"  "$c_off" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$c_green" "$c_off" "$*"; }
+warn() { printf '%s⚠%s %s\n' "$c_yellow" "$c_off" "$*"; }
+err()  { printf '%s✗%s %s\n' "$c_red"   "$c_off" "$*" >&2; }
+
+DRY_RUN=0
+TEACH_BRANCH=""
+case "${1:-}" in
+    --dry-run|-n) DRY_RUN=1 ;;
+    --teach)      TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; } ;;
+    "")           ;;
+    *)            err "unknown argument: $1"; exit 1 ;;
+esac
+
+WT=""           # candidate worktree path (set later)
+cleanup() {
+    if [[ -n "$WT" && -d "$WT" ]]; then
+        git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
+    fi
+    git -C "$REPO" branch -D _candidate >/dev/null 2>&1 || true
+    git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── --teach <branch>: prime rerere for a conflicting feature ──────────────────
+# Sets up the exact merge (feature onto upstream/main) in an isolated worktree so
+# you resolve the conflict ONCE; your commit records the rerere resolution, which
+# the next update auto-applies. Touches neither the live checkout nor any branch
+# the agent runs on.
+if [[ -n "$TEACH_BRANCH" ]]; then
+    cd "$REPO"
+    say "Teach mode: priming rerere for $TEACH_BRANCH against $UPSTREAM_REMOTE/$MAIN_BRANCH"
+    git fetch --quiet "$UPSTREAM_REMOTE"
+    git show-ref --verify --quiet "refs/heads/$TEACH_BRANCH" || { err "branch '$TEACH_BRANCH' not found"; exit 1; }
+    san="${TEACH_BRANCH//\//-}"
+    TWT="$(mktemp -u -t hermes-teach-"$san".XXXXXX)"
+    git branch -D "_teach_$san" >/dev/null 2>&1 || true
+    git worktree add --quiet -b "_teach_$san" "$TWT" "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+    if git -C "$TWT" merge --no-edit "$TEACH_BRANCH" >/dev/null 2>&1; then
+        ok "$TEACH_BRANCH merges cleanly onto $UPSTREAM_REMOTE/$MAIN_BRANCH — nothing to teach."
+        git worktree remove --force "$TWT" >/dev/null 2>&1 || true
+        git branch -D "_teach_$san" >/dev/null 2>&1 || true
+    elif [[ -z "$(git -C "$TWT" ls-files -u)" ]]; then
+        git -C "$TWT" commit --no-edit >/dev/null 2>&1 || true
+        ok "rerere already resolves this — re-affirmed. Nothing more to teach."
+        git worktree remove --force "$TWT" >/dev/null 2>&1 || true
+        git branch -D "_teach_$san" >/dev/null 2>&1 || true
+    else
+        warn "Conflict — resolve it once to teach rerere:"
+        echo "  conflicted files:"
+        git -C "$TWT" diff --name-only --diff-filter=U | sed 's/^/    /'
+        echo
+        echo "  1) cd $TWT"
+        echo "  2) resolve the files above, then:  git add -A && git commit --no-edit"
+        echo "     (that commit is what records the rerere resolution)"
+        echo "  3) clean up:  git -C \"$REPO\" worktree remove \"$TWT\" && git -C \"$REPO\" branch -D _teach_$san"
+        echo
+        say "After step 2, the next 'hermes-update-local' auto-applies it and keeps $TEACH_BRANCH."
+    fi
+    exit 0
+fi
+
+# Import smoke test against a given checkout dir. Catches syntax errors and
+# import-time failures (the exact class of breakage that crashed the CLI before).
+smoke_test() {
+    local dir="$1"
+    ( cd "$dir" && PYTHONPATH="$dir" "$VENV_PY" -c "import run_agent" ) >/dev/null 2>&1
+}
+
+# ── 0. Pre-flight ────────────────────────────────────────────────────────────
+cd "$REPO"
+[[ -x "$VENV_PY" ]] || { err "venv python not found at $VENV_PY"; exit 1; }
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    err "Working tree is dirty. Commit/stash changes before updating."
+    git status --short
+    exit 1
+fi
+START_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+git branch -D _candidate >/dev/null 2>&1 || true
+
+(( DRY_RUN )) && warn "DRY RUN — no live branches, pushes, or checkouts will change."
+
+# ── Load feature list from config ────────────────────────────────────────────
+if [[ -f "$FEATURES_CONF" ]]; then
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        line="${raw#"${raw%%[![:space:]]*}"}"     # ltrim
+        line="${line%"${line##*[![:space:]]}"}"    # rtrim
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        br="${line%%[[:space:]]*}"                 # first token = branch name
+        rest="${line#"$br"}"; rest="${rest#"${rest%%[![:space:]]*}"}"   # annotation, ltrimmed
+        [[ "$rest" == *'!required'* ]] && REQUIRED["$br"]=1
+        FEATURE_BRANCHES+=("$br")
+    done < "$FEATURES_CONF"
+else
+    warn "Config $FEATURES_CONF not found — no features will be integrated."
+fi
+if (( ${#FEATURE_BRANCHES[@]} == 0 )); then
+    warn "No feature branches configured — update will produce plain $MAIN_BRANCH only."
+else
+    say "Features (from ${FEATURES_CONF/#$HOME/\~}): ${FEATURE_BRANCHES[*]}"
+fi
+
+# ── 1. Fetch official (read-only) ────────────────────────────────────────────
+say "Fetching $UPSTREAM_REMOTE (Nous) and $ORIGIN_REMOTE (fork)..."
+git fetch --quiet "$UPSTREAM_REMOTE"
+git fetch --quiet "$ORIGIN_REMOTE" || true
+
+UPSTREAM_MAIN="$(git rev-parse "$UPSTREAM_REMOTE/$MAIN_BRANCH")"
+LOCAL_MAIN="$(git rev-parse "$MAIN_BRANCH")"
+PREV_MAIN="$LOCAL_MAIN"
+
+if [[ "$LOCAL_MAIN" == "$UPSTREAM_MAIN" ]]; then
+    ok "main already up to date ($(git rev-parse --short "$UPSTREAM_MAIN"))."
+elif git merge-base --is-ancestor "$LOCAL_MAIN" "$UPSTREAM_MAIN"; then
+    ok "main is behind by $(git rev-list --count "$MAIN_BRANCH..$UPSTREAM_REMOTE/$MAIN_BRANCH") commit(s) — fast-forwardable to $(git rev-parse --short "$UPSTREAM_MAIN")."
+else
+    err "Local main has diverged from $UPSTREAM_REMOTE/$MAIN_BRANCH (not fast-forwardable)."
+    err "Refusing to touch it. Inspect manually."
+    exit 1
+fi
+
+# Did dependency files change between current main and upstream?
+DEPS_CHANGED=0
+if [[ "$LOCAL_MAIN" != "$UPSTREAM_MAIN" ]]; then
+    if [[ -n "$(git diff --name-only "$LOCAL_MAIN" "$UPSTREAM_MAIN" -- "${DEP_FILES[@]}" 2>/dev/null)" ]]; then
+        DEPS_CHANGED=1
+    fi
+fi
+
+# ── 2. Build candidate working in an isolated worktree ───────────────────────
+say "Building candidate $WORKING_BRANCH from $UPSTREAM_REMOTE/$MAIN_BRANCH (isolated worktree)..."
+WT="$(mktemp -u -t hermes-cand.XXXXXX)"
+git worktree add --quiet -b _candidate "$WT" "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+
+KEPT=(); DROPPED=(); REQUIRED_DROPPED=(); CONFLICT_DROPPED=()
+note_drop() { [[ -n "${REQUIRED[$1]:-}" ]] && REQUIRED_DROPPED+=("$1"); return 0; }   # flag required losses (must return 0 under set -e)
+for f in "${FEATURE_BRANCHES[@]}"; do
+    if ! git -C "$WT" show-ref --verify --quiet "refs/heads/$f"; then
+        warn "  $f — branch missing, skipping."
+        DROPPED+=("$f (missing)"); note_drop "$f"
+        continue
+    fi
+    before="$(git -C "$WT" rev-parse HEAD)"
+    merged_ok=0
+    if git -C "$WT" merge --no-edit "$f" >/dev/null 2>&1; then
+        merged_ok=1                                   # clean merge
+    elif [[ -z "$(git -C "$WT" ls-files -u)" ]]; then
+        # No unmerged entries left → rerere resolved everything; finish the merge.
+        if git -C "$WT" commit --no-edit >/dev/null 2>&1; then
+            merged_ok=1
+            printf '%s  rerere auto-resolved a conflict in %s%s\n' "$c_dim" "$f" "$c_off"
+        fi
+    fi
+
+    if (( ! merged_ok )); then
+        git -C "$WT" merge --abort >/dev/null 2>&1 || git -C "$WT" reset --hard "$before" >/dev/null 2>&1
+        warn "  $f — unresolved conflict, DROPPED."
+        DROPPED+=("$f (conflict)"); CONFLICT_DROPPED+=("$f"); note_drop "$f"
+        continue
+    fi
+
+    if smoke_test "$WT"; then
+        ok "  $f — merged & imports clean."
+        KEPT+=("$f")
+    else
+        git -C "$WT" reset --hard "$before" >/dev/null 2>&1
+        warn "  $f — merged but import smoke test FAILED, DROPPED."
+        DROPPED+=("$f (broken import)"); note_drop "$f"
+    fi
+done
+
+# Final guard: candidate must import even with all kept features.
+CANDIDATE_OK=0
+if (( ${#KEPT[@]} > 0 )) && smoke_test "$WT"; then
+    CANDIDATE_OK=1
+fi
+CANDIDATE_SHA="$(git -C "$WT" rev-parse HEAD)"
+
+# ── 3. Decide & apply ────────────────────────────────────────────────────────
+echo
+say "Summary:"
+printf '   kept    : %s\n' "${KEPT[*]:-(none)}"
+printf '   dropped : %s\n' "${DROPPED[*]:-(none)}"
+(( DEPS_CHANGED )) && printf '   deps    : %schanged in upstream — reinstall needed%s\n' "$c_yellow" "$c_off"
+
+# Staleness guard: a conflict drop means rerere had no matching resolution.
+# Surface it loudly and actionably so it's never a silent loss.
+if (( ${#CONFLICT_DROPPED[@]} > 0 )); then
+    echo
+    warn "Unresolved conflicts (no rerere resolution) — these were EXCLUDED:"
+    printf '     %s\n' "${CONFLICT_DROPPED[@]}"
+    echo "   Re-teach each, then re-run:  hermes-update-local --teach <branch>"
+fi
+
+# Required-feature guard: a dropped !required feature must block the publish.
+if (( ${#REQUIRED_DROPPED[@]} > 0 )); then
+    echo
+    err "REQUIRED feature(s) did not survive: ${REQUIRED_DROPPED[*]}"
+    if (( DRY_RUN )); then
+        warn "DRY RUN: would ABORT publish and keep current $WORKING_BRANCH unchanged."
+        say "DRY RUN complete. No live changes made. Still on: $START_BRANCH"
+    else
+        err "Refusing to publish a degraded $WORKING_BRANCH. Live checkout left untouched on $START_BRANCH."
+        err "Teach the resolution, then re-run:  hermes-update-local --teach ${REQUIRED_DROPPED[0]}"
+    fi
+    exit 1
+fi
+
+if (( DRY_RUN )); then
+    echo
+    if (( CANDIDATE_OK )); then
+        ok "DRY RUN: would publish $WORKING_BRANCH @ $(git rev-parse --short "$CANDIDATE_SHA") and check it out."
+    else
+        warn "DRY RUN: no feature survived — would fall back to plain $MAIN_BRANCH."
+    fi
+    (( DEPS_CHANGED )) && warn "DRY RUN: would reinstall dependencies (deps changed)."
+    say "DRY RUN complete. No live changes made. Still on: $START_BRANCH"
+    exit 0
+fi
+
+# Real run: sync main + fork mirror.
+say "Syncing $MAIN_BRANCH and fork mirror..."
+git checkout --quiet "$MAIN_BRANCH"
+git merge --ff-only --quiet "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+git push --quiet "$ORIGIN_REMOTE" "$MAIN_BRANCH"
+ok "main → $(git rev-parse --short HEAD), fork mirror updated."
+
+# Reinstall deps if upstream changed them.
+if (( DEPS_CHANGED )); then
+    say "Reinstalling dependencies (deps changed)..."
+    # venv is uv-managed and has no pip, so use uv (not "python -m pip").
+    if uv pip install -e "$REPO" --python "$VENV_PY" >/dev/null 2>&1; then
+        ok "dependencies reinstalled."
+    else
+        warn "dependency reinstall failed — run 'hermes update' or 'uv pip install -e .' manually."
+    fi
+fi
+
+# Publish working or fall back to main.
+if (( CANDIDATE_OK )); then
+    git branch -f "$WORKING_BRANCH" "$CANDIDATE_SHA"
+    git checkout --quiet "$WORKING_BRANCH"
+    git push --force-with-lease --quiet "$ORIGIN_REMOTE" "$WORKING_BRANCH"
+    ok "Published $WORKING_BRANCH @ $(git rev-parse --short HEAD) (kept: ${KEPT[*]})."
+else
+    # Already on main from the sync step.
+    warn "No feature survived integration — staying on plain $MAIN_BRANCH (official only)."
+fi
+
+echo
+if (( ${#DROPPED[@]} > 0 )); then
+    warn "Dropped features: ${DROPPED[*]}"
+    echo "  To recover one, teach rerere its resolution once:"
+    echo "    hermes-update-local --teach <dropped-branch>"
+    echo "  Resolve the conflict it sets up and commit; the next run auto-applies it."
+fi
+ok "Done. Now on: $(git rev-parse --abbrev-ref HEAD)"
+git --no-pager log --oneline -5
