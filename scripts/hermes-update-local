@@ -54,11 +54,13 @@ err()  { printf '%s✗%s %s\n' "$c_red"   "$c_off" "$*" >&2; }
 
 DRY_RUN=0
 TEACH_BRANCH=""
+MODE="update"
 case "${1:-}" in
-    --dry-run|-n) DRY_RUN=1 ;;
-    --teach)      TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; } ;;
-    "")           ;;
-    *)            err "unknown argument: $1"; exit 1 ;;
+    --dry-run|-n)                DRY_RUN=1 ;;
+    --teach)                     TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; } ;;
+    --evaluate|--audit-features) MODE="evaluate" ;;
+    "")                          ;;
+    *)                           err "unknown argument: $1"; exit 1 ;;
 esac
 
 WT=""           # candidate worktree path (set later)
@@ -67,9 +69,192 @@ cleanup() {
         git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
     fi
     git -C "$REPO" branch -D _candidate >/dev/null 2>&1 || true
+    git -C "$REPO" branch -D _eval >/dev/null 2>&1 || true
     git -C "$REPO" worktree prune >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+# ── Phase-0 evaluation helpers (read-only; shared loader) ────────────────────
+# Feature-list loader, shared by the normal update flow and --evaluate.
+load_features() {
+    if [[ -f "$FEATURES_CONF" ]]; then
+        while IFS= read -r raw || [[ -n "$raw" ]]; do
+            line="${raw#"${raw%%[![:space:]]*}"}"     # ltrim
+            line="${line%"${line##*[![:space:]]}"}"    # rtrim
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            br="${line%%[[:space:]]*}"                 # first token = branch name
+            rest="${line#"$br"}"; rest="${rest#"${rest%%[![:space:]]*}"}"   # annotation, ltrimmed
+            [[ "$rest" == *'!required'* ]] && REQUIRED["$br"]=1
+            FEATURE_BRANCHES+=("$br")
+        done < "$FEATURES_CONF"
+    else
+        warn "Config $FEATURES_CONF not found — no features will be integrated."
+    fi
+}
+
+# join non-blank stdin lines with $1 as the separator
+_join() { awk -v s="$1" 'NF{if(n++)printf "%s",s; printf "%s",$0} END{if(n)print ""}'; }
+
+# unique enclosing-symbol context from a unified diff on stdin (git prints the
+# enclosing def/class after the second @@ on each hunk header)
+hunk_contexts() { grep -E '^@@' | sed -E 's/^@@[^@]*@@[[:space:]]*//; s/[[:space:]]+$//' | grep -vE '^$' | sort -u; }
+
+# branch name -> '|'-joined keyword regex (drop <4-char tokens + stopwords).
+# Phase-0 changelog proxy until hermes-feature-probes.conf lands (Phase 1).
+branch_keywords() {
+    local name="$1" tok; local -a out=(); local oldifs="$IFS"
+    IFS='-'; for tok in $name; do IFS="$oldifs"
+        [[ ${#tok} -lt 4 ]] && { IFS='-'; continue; }
+        case "$tok" in only|with|from|into|this|that|your|true|false) IFS='-'; continue ;; esac
+        out+=("$tok"); IFS='-'
+    done; IFS="$oldifs"
+    ( IFS='|'; printf '%s' "${out[*]:-}" )
+}
+
+# probe a feature merge onto upstream/main in a throwaway worktree, then undo.
+# echoes: clean | rerere | conflict  (reuses rerere => matches publish behavior)
+probe_merge() {
+    local wt="$1" f="$2" base; base="$(git -C "$wt" rev-parse HEAD)"
+    if git -C "$wt" merge --no-edit "$f" >/dev/null 2>&1; then
+        git -C "$wt" reset --hard "$base" >/dev/null 2>&1; echo clean
+    elif [[ -z "$(git -C "$wt" ls-files -u)" ]]; then
+        git -C "$wt" merge --abort >/dev/null 2>&1; git -C "$wt" reset --hard "$base" >/dev/null 2>&1; echo rerere
+    else
+        git -C "$wt" merge --abort >/dev/null 2>&1; git -C "$wt" reset --hard "$base" >/dev/null 2>&1; echo conflict
+    fi
+}
+
+# ── --evaluate / --audit-features (READ-ONLY) ────────────────────────────────
+# Per custom feature, surface DETERMINISTIC evidence of how it relates to the
+# incoming upstream delta (main..upstream/main): the files/symbols it touches,
+# whether upstream changed the same regions, a merge probe, and changelog
+# keyword hits. No LLM, no network beyond `git fetch`, and it NEVER mutates a
+# tracked branch / the conf / the live checkout — all work happens in a throwaway
+# worktree. Phase-0 buckets: INDEPENDENT / REVIEW / CONFLICT. (Phase 1/2 will
+# split REVIEW into covered / complementary / hidden via a probes manifest and
+# an optional local LLM judge.)
+run_evaluate() {
+    set +e +o pipefail   # read-only reporting; empty greps are expected, not errors
+    cd "$REPO"
+    say "Evaluate mode (READ-ONLY): comparing custom features against the incoming upstream delta."
+    git fetch --quiet "$UPSTREAM_REMOTE" || { err "fetch $UPSTREAM_REMOTE failed"; return 1; }
+    git fetch --quiet "$ORIGIN_REMOTE" 2>/dev/null || true
+
+    local upstream_main prev_main behind
+    upstream_main="$(git rev-parse "$UPSTREAM_REMOTE/$MAIN_BRANCH")"
+    prev_main="$(git rev-parse "$MAIN_BRANCH")"
+    if [[ "$prev_main" == "$upstream_main" ]]; then
+        ok "main is already at $UPSTREAM_REMOTE/$MAIN_BRANCH ($(git rev-parse --short "$upstream_main")) — no upstream delta to evaluate."
+        return 0
+    fi
+    git merge-base --is-ancestor "$prev_main" "$upstream_main" \
+        || warn "main is not fast-forwardable to upstream/main (diverged) — evaluating the delta regardless."
+    behind="$(git rev-list --count "$prev_main..$upstream_main")"
+
+    load_features
+    if (( ${#FEATURE_BRANCHES[@]} == 0 )); then warn "No feature branches configured — nothing to evaluate."; return 0; fi
+
+    say "Upstream delta: $(git rev-parse --short "$prev_main") .. $(git rev-parse --short "$upstream_main")  ($behind commit(s) ahead)"
+    say "Features: ${FEATURE_BRANCHES[*]}"
+
+    local changelog; changelog="$(git log --oneline --no-merges "$prev_main..$upstream_main")"
+
+    local evwt; evwt="$(mktemp -u -t hermes-eval.XXXXXX)"
+    git branch -D _eval >/dev/null 2>&1 || true
+    git worktree add --quiet -b _eval "$evwt" "$upstream_main" || { err "could not create eval worktree"; return 1; }
+    WT="$evwt"   # hand to the EXIT-trap cleanup
+
+    local report_dir="${HERMES_EVAL_DIR:-$HOME/.hermes/eval-reports}"
+    mkdir -p "$report_dir"
+    local report="$report_dir/REPORT-$(git rev-parse --short "$upstream_main").md"
+    { echo "# hermes feature evaluation (Phase 0)"; echo
+      echo "- delta: \`$(git rev-parse --short "$prev_main")\` .. \`$(git rev-parse --short "$upstream_main")\` ($behind commits)"
+      echo; } > "$report"
+
+    # intra-fork file-collision matrix (independent of upstream)
+    local tmpd; tmpd="$(mktemp -d -t hermes-eval-files.XXXXXX)"; local f
+    for f in "${FEATURE_BRANCHES[@]}"; do
+        git show-ref --verify --quiet "refs/heads/$f" || continue
+        git diff --name-only "$MAIN_BRANCH...$f" > "$tmpd/${f//\//-}.files" 2>/dev/null
+    done
+    echo; say "Intra-fork file collisions (same file touched by >1 feature):"
+    { echo "## intra-fork file collisions"; echo; } >> "$report"
+    local collided; collided="$(cat "$tmpd"/*.files 2>/dev/null | sort | uniq -d)"
+    if [[ -n "$collided" ]]; then
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local owners=""
+            for f in "${FEATURE_BRANCHES[@]}"; do
+                [[ -f "$tmpd/${f//\//-}.files" ]] && grep -qxF "$file" "$tmpd/${f//\//-}.files" && owners+="${f##*/} "
+            done
+            printf '   %-46s ← %s\n' "$file" "$owners"; echo "- \`$file\` ← $owners" >> "$report"
+        done <<< "$collided"
+    else
+        echo "   (none)"; echo "_(none)_" >> "$report"
+    fi
+
+    # per-feature evidence
+    echo; { echo; echo "## per-feature evidence"; echo; } >> "$report"
+    for f in "${FEATURE_BRANCHES[@]}"; do
+        if ! git show-ref --verify --quiet "refs/heads/$f"; then
+            warn "→ $f — branch missing, skipped."; { echo "### $f — MISSING"; echo; } >> "$report"; continue
+        fi
+        local filesF nfiles overlap symF symUp symOverlap probe kw clog bucket bcol
+        filesF="$(git diff --name-only "$MAIN_BRANCH...$f" 2>/dev/null)"
+        nfiles="$(printf '%s\n' "$filesF" | grep -cve '^$')"
+        overlap=""; [[ -n "$filesF" ]] && overlap="$(git diff --name-only "$prev_main" "$upstream_main" -- $filesF 2>/dev/null | sort -u)"
+        symOverlap=""
+        if [[ -n "$overlap" ]]; then
+            symF="$(git diff "$MAIN_BRANCH...$f" -- $overlap 2>/dev/null | hunk_contexts)"
+            symUp="$(git diff "$prev_main" "$upstream_main" -- $overlap 2>/dev/null | hunk_contexts)"
+            [[ -n "$symF" && -n "$symUp" ]] && symOverlap="$(printf '%s\n' "$symF" | grep -Fxf <(printf '%s\n' "$symUp"))"
+        fi
+        probe="$(probe_merge "$evwt" "$f")"
+        kw="$(branch_keywords "${f##*/}")"
+        clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$changelog" | grep -iE "$kw" | head -8)"
+
+        if [[ "$probe" == "conflict" || "$probe" == "rerere" ]]; then bucket="CONFLICT"; bcol="$c_red"
+        elif [[ -n "$overlap" || -n "$clog" ]]; then bucket="REVIEW"; bcol="$c_yellow"
+        else bucket="INDEPENDENT"; bcol="$c_green"; fi
+
+        printf '\n%s→ %s%s   [%s%s%s]\n' "$c_blue" "$f" "$c_off" "$bcol" "$bucket" "$c_off"
+        printf '    files touched (%s): %s\n' "${nfiles:-0}" "$(printf '%s' "$filesF" | _join ', ')"
+        if [[ -n "$overlap" ]]; then
+            printf '    %s⚠ upstream also changed:%s %s\n' "$c_yellow" "$c_off" "$(printf '%s' "$overlap" | _join ', ')"
+            [[ -n "$symOverlap" ]] && printf '      symbol overlap: %s\n' "$(printf '%s' "$symOverlap" | _join ' | ')"
+        else
+            printf '    upstream changes to those files: none\n'
+        fi
+        printf '    merge probe: %s\n' "$probe"
+        if [[ -n "$clog" ]]; then printf '    changelog hits (%s):\n' "$kw"; printf '%s\n' "$clog" | sed 's/^/        /'
+        else printf '    changelog hits (%s): none\n' "${kw:-—}"; fi
+
+        { echo "### $f — $bucket"; echo
+          echo "- files touched ($nfiles): $(printf '%s' "$filesF" | _join ', ')"
+          if [[ -n "$overlap" ]]; then
+              echo "- ⚠ upstream also changed: $(printf '%s' "$overlap" | _join ', ')"
+              [[ -n "$symOverlap" ]] && echo "- symbol overlap: $(printf '%s' "$symOverlap" | _join ' | ')"
+          else echo "- upstream changes to those files: none"; fi
+          echo "- merge probe: $probe"
+          if [[ -n "$clog" ]]; then echo "- changelog hits (\`$kw\`):"; printf '%s\n' "$clog" | sed 's/^/    - /'
+          else echo "- changelog hits: none"; fi
+          echo; } >> "$report"
+    done
+    rm -rf "$tmpd" 2>/dev/null || true
+
+    printf '\n  %sLegend (Phase 0 — deterministic, no LLM):%s\n' "$c_dim" "$c_off"
+    cat <<'LEGEND'
+    INDEPENDENT  no upstream overlap + clean merge — keep as-is.
+    REVIEW       upstream touched the same files/symbols, or a changelog keyword matched.
+                 Classify by hand: covered-by-upstream (retire?) / complementary (integrate) /
+                 hidden-by-your-reroute (forward-port the upstream change).
+    CONFLICT     merge needs a (rerere) resolution — a real update would rerere-resolve or drop it.
+LEGEND
+    echo; ok "Report: ${report/#$HOME/\~}"
+    return 0
+}
+
+if [[ "$MODE" == "evaluate" ]]; then run_evaluate; exit $?; fi
 
 # ── --teach <branch>: prime rerere for a conflicting feature ──────────────────
 # Sets up the exact merge (feature onto upstream/main) in an isolated worktree so
@@ -131,19 +316,7 @@ git branch -D _candidate >/dev/null 2>&1 || true
 (( DRY_RUN )) && warn "DRY RUN — no live branches, pushes, or checkouts will change."
 
 # ── Load feature list from config ────────────────────────────────────────────
-if [[ -f "$FEATURES_CONF" ]]; then
-    while IFS= read -r raw || [[ -n "$raw" ]]; do
-        line="${raw#"${raw%%[![:space:]]*}"}"     # ltrim
-        line="${line%"${line##*[![:space:]]}"}"    # rtrim
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        br="${line%%[[:space:]]*}"                 # first token = branch name
-        rest="${line#"$br"}"; rest="${rest#"${rest%%[![:space:]]*}"}"   # annotation, ltrimmed
-        [[ "$rest" == *'!required'* ]] && REQUIRED["$br"]=1
-        FEATURE_BRANCHES+=("$br")
-    done < "$FEATURES_CONF"
-else
-    warn "Config $FEATURES_CONF not found — no features will be integrated."
-fi
+load_features
 if (( ${#FEATURE_BRANCHES[@]} == 0 )); then
     warn "No feature branches configured — update will produce plain $MAIN_BRANCH only."
 else
