@@ -39,6 +39,11 @@ VENV_PY="$REPO/venv/bin/python"
 # (one branch per line, in merge order). Edit THAT file to add/remove features —
 # no need to touch this script. Override the path with $HERMES_FEATURES_CONF.
 FEATURES_CONF="${HERMES_FEATURES_CONF:-$HOME/.hermes/hermes-features.conf}"
+# Phase-1 feature metadata for --evaluate (owned/rerouted symbols, topic keywords).
+# Lives beside this script in the repo; located via the script's REAL path (symlink resolved),
+# so it works both from a worktree and via the ~/.hermes/bin symlink. Override: $HERMES_PROBES_CONF.
+_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+PROBES_CONF="${HERMES_PROBES_CONF:-$(dirname "$_SELF")/hermes-feature-probes.conf}"
 FEATURE_BRANCHES=()
 declare -A REQUIRED=()   # branch -> 1 when annotated "!required" in the conf
 
@@ -124,6 +129,61 @@ probe_merge() {
     fi
 }
 
+# Parse hermes-feature-probes.conf into PROBE_KW/PROBE_OWNED/PROBE_REROUTE keyed by branch.
+load_probes() {
+    declare -gA PROBE_KW PROBE_OWNED PROBE_REROUTE
+    PROBE_LOADED=0
+    [[ -f "$PROBES_CONF" ]] || return 0
+    PROBE_LOADED=1
+    local raw line br kw owned rr
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        line="${raw%$'\r'}"; line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        IFS='|' read -r br kw owned rr <<< "$line"
+        br="${br//[[:space:]]/}"; [[ -z "$br" ]] && continue
+        kw="${kw#"${kw%%[![:space:]]*}"}"; kw="${kw%"${kw##*[![:space:]]}"}"
+        PROBE_KW["$br"]="$kw"
+        PROBE_OWNED["$br"]="${owned//[[:space:]]/}"
+        PROBE_REROUTE["$br"]="${rr//[[:space:]]/}"
+    done < "$PROBES_CONF"
+}
+
+# How many of a feature's owned-symbols already exist in upstream/main code. Echoes "n/total".
+count_owned_in_upstream() {
+    local owned="$1" up="$2" o n=0 total=0
+    [[ -z "$owned" ]] && { echo "0/0"; return; }
+    local IFS=','
+    for o in $owned; do
+        o="${o//[[:space:]]/}"; [[ -z "$o" ]] && continue
+        total=$((total + 1))
+        git grep -lF "$o" "$up" -- '*.py' >/dev/null 2>&1 && n=$((n + 1))
+    done
+    echo "$n/$total"
+}
+
+# Which rerouted symbols upstream changed (found in the feature's files' upstream diff). Echoes a list.
+reroute_changed_list() {
+    local reroutes="$1" updiff="$2" s out=""
+    [[ -z "$reroutes" ]] && { echo ""; return; }
+    local IFS=','
+    for s in $reroutes; do
+        s="${s//[[:space:]]/}"; [[ -z "$s" ]] && continue
+        printf '%s' "$updiff" | grep -qF "$s" && out+="$s "
+    done
+    echo "$out"
+}
+
+# Feature files that existed in the OLD base but upstream renamed/removed. Echoes a list.
+moved_files_list() {
+    local files="$1" prev="$2" up="$3" file out=""
+    [[ -z "$files" ]] && { echo ""; return; }
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        if git cat-file -e "$prev:$file" 2>/dev/null && ! git cat-file -e "$up:$file" 2>/dev/null; then out+="$file "; fi
+    done <<< "$files"
+    echo "$out"
+}
+
 # ── --evaluate / --audit-features (READ-ONLY) ────────────────────────────────
 # Per custom feature, surface DETERMINISTIC evidence of how it relates to the
 # incoming upstream delta (main..upstream/main): the files/symbols it touches,
@@ -153,6 +213,10 @@ run_evaluate() {
 
     load_features
     if (( ${#FEATURE_BRANCHES[@]} == 0 )); then warn "No feature branches configured — nothing to evaluate."; return 0; fi
+    load_probes
+    [[ "${PROBE_LOADED:-0}" == 1 ]] \
+        && say "Probes manifest: ${PROBES_CONF/#$HOME/\~}" \
+        || warn "No probes manifest at ${PROBES_CONF/#$HOME/\~} — Phase-0 evidence only (no 4-bucket classification)."
 
     say "Upstream delta: $(git rev-parse --short "$prev_main") .. $(git rev-parse --short "$upstream_main")  ($behind commit(s) ahead)"
     say "Features: ${FEATURE_BRANCHES[*]}"
@@ -167,7 +231,7 @@ run_evaluate() {
     local report_dir="${HERMES_EVAL_DIR:-$HOME/.hermes/eval-reports}"
     mkdir -p "$report_dir"
     local report="$report_dir/REPORT-$(git rev-parse --short "$upstream_main").md"
-    { echo "# hermes feature evaluation (Phase 0)"; echo
+    { echo "# hermes feature evaluation (Phase 1)"; echo
       echo "- delta: \`$(git rev-parse --short "$prev_main")\` .. \`$(git rev-parse --short "$upstream_main")\` ($behind commits)"
       echo; } > "$report"
 
@@ -193,16 +257,18 @@ run_evaluate() {
         echo "   (none)"; echo "_(none)_" >> "$report"
     fi
 
-    # per-feature evidence
-    echo; { echo; echo "## per-feature evidence"; echo; } >> "$report"
+    # per-feature classification (Phase 1)
+    echo; { echo; echo "## per-feature classification"; echo; } >> "$report"
     for f in "${FEATURE_BRANCHES[@]}"; do
         if ! git show-ref --verify --quiet "refs/heads/$f"; then
             warn "→ $f — branch missing, skipped."; { echo "### $f — MISSING"; echo; } >> "$report"; continue
         fi
-        local filesF nfiles overlap symF symUp symOverlap probe kw clog bucket bcol
+        local filesF nfiles overlap noverlap symF symUp symOverlap probe kw clog
+        local has_probe owned reroutes updiff reroute_changed moved cov _cov_n _cov_total bucket bcol rec
         filesF="$(git diff --name-only "$MAIN_BRANCH...$f" 2>/dev/null)"
         nfiles="$(printf '%s\n' "$filesF" | grep -cve '^$')"
         overlap=""; [[ -n "$filesF" ]] && overlap="$(git diff --name-only "$prev_main" "$upstream_main" -- $filesF 2>/dev/null | sort -u)"
+        noverlap="$(printf '%s\n' "$overlap" | grep -cve '^$')"
         symOverlap=""
         if [[ -n "$overlap" ]]; then
             symF="$(git diff "$MAIN_BRANCH...$f" -- $overlap 2>/dev/null | hunk_contexts)"
@@ -210,45 +276,74 @@ run_evaluate() {
             [[ -n "$symF" && -n "$symUp" ]] && symOverlap="$(printf '%s\n' "$symF" | grep -Fxf <(printf '%s\n' "$symUp"))"
         fi
         probe="$(probe_merge "$evwt" "$f")"
-        kw="$(branch_keywords "${f##*/}")"
-        clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$changelog" | grep -iE "$kw" | head -8)"
+        moved="$(moved_files_list "$filesF" "$prev_main" "$upstream_main")"
 
-        if [[ "$probe" == "conflict" || "$probe" == "rerere" ]]; then bucket="CONFLICT"; bcol="$c_red"
-        elif [[ -n "$overlap" || -n "$clog" ]]; then bucket="REVIEW"; bcol="$c_yellow"
-        else bucket="INDEPENDENT"; bcol="$c_green"; fi
-
-        printf '\n%s→ %s%s   [%s%s%s]\n' "$c_blue" "$f" "$c_off" "$bcol" "$bucket" "$c_off"
-        printf '    files touched (%s): %s\n' "${nfiles:-0}" "$(printf '%s' "$filesF" | _join ', ')"
-        if [[ -n "$overlap" ]]; then
-            printf '    %s⚠ upstream also changed:%s %s\n' "$c_yellow" "$c_off" "$(printf '%s' "$overlap" | _join ', ')"
-            [[ -n "$symOverlap" ]] && printf '      symbol overlap: %s\n' "$(printf '%s' "$symOverlap" | _join ' | ')"
+        if [[ -n "${PROBE_KW[$f]+x}" ]]; then
+            has_probe=1
+            kw="$(printf '%s' "${PROBE_KW[$f]}" | sed -E 's/[[:space:]]*,[[:space:]]*/|/g; s/^\|+//; s/\|+$//')"
+            owned="${PROBE_OWNED[$f]}"; reroutes="${PROBE_REROUTE[$f]}"
+            cov="$(count_owned_in_upstream "$owned" "$upstream_main")"; _cov_n="${cov%/*}"; _cov_total="${cov#*/}"
+            updiff="$(git diff "$prev_main" "$upstream_main" -- $filesF 2>/dev/null)"
+            reroute_changed="$(reroute_changed_list "$reroutes" "$updiff")"
         else
-            printf '    upstream changes to those files: none\n'
+            has_probe=0; kw="$(branch_keywords "${f##*/}")"; cov="0/0"; _cov_n=0; _cov_total=0; reroute_changed=""
         fi
-        printf '    merge probe: %s\n' "$probe"
-        if [[ -n "$clog" ]]; then printf '    changelog hits (%s):\n' "$kw"; printf '%s\n' "$clog" | sed 's/^/        /'
-        else printf '    changelog hits (%s): none\n' "${kw:-—}"; fi
+        clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$changelog" | grep -iE "$kw" 2>/dev/null | head -8)"
 
+        if (( has_probe )); then
+            if (( _cov_total > 0 && _cov_n == _cov_total )); then
+                bucket="FULLY_COVERED"; bcol="$c_green"
+                rec="upstream now defines ALL the feature's distinctive symbols → RETIRE candidate (confirm, then drop from the features conf — never auto-retired)."
+            elif [[ -n "$reroute_changed" ]]; then
+                bucket="GAP_HIDDEN"; bcol="$c_red"
+                rec="upstream changed symbol(s) you reroute (${reroute_changed%% }) — a clean merge can HIDE that change. Forward-port it, or slim the feature."
+            elif [[ "$probe" == conflict || "$probe" == rerere || -n "$moved" ]]; then
+                bucket="CONFLICT"; bcol="$c_yellow"
+                rec="merge needs a resolution${moved:+ (upstream MOVED ${moved%% } → re-anchor)}. Run --teach <branch> to record it."
+            elif [[ -n "$overlap" || -n "$clog" || "${_cov_n:-0}" -gt 0 ]]; then
+                bucket="COMPLEMENTARY"; bcol="$c_blue"
+                rec="same region, different purpose (or partial coverage) → keep; re-anchor hunks if needed."
+            else
+                bucket="INDEPENDENT"; bcol="$c_dim"; rec="no upstream overlap, clean merge → keep as-is."
+            fi
+        else
+            if [[ "$probe" == conflict || "$probe" == rerere || -n "$moved" ]]; then bucket="CONFLICT"; bcol="$c_yellow"
+            elif [[ -n "$overlap" || -n "$clog" ]]; then bucket="REVIEW"; bcol="$c_yellow"
+            else bucket="INDEPENDENT"; bcol="$c_dim"; fi
+            rec="(no probe row — add one to ${PROBES_CONF##*/} for full classification)"
+        fi
+
+        # ---- stdout ----
+        printf '\n%s→ %s%s   [%s%s%s]\n' "$c_blue" "$f" "$c_off" "$bcol" "$bucket" "$c_off"
+        printf '    %s%s%s\n' "$c_dim" "$rec" "$c_off"
+        printf '    files %s | overlap %s | owned-in-upstream %s | merge %s%s%s\n' \
+            "${nfiles:-0}" "${noverlap:-0}" "$cov" "$probe" \
+            "${reroute_changed:+ | reroutes-changed: ${reroute_changed%% }}" "${moved:+ | moved: ${moved%% }}"
+        [[ -n "$overlap" ]] && printf '      upstream also changed: %s\n' "$(printf '%s' "$overlap" | _join ', ')"
+        [[ -n "$symOverlap" ]] && printf '      symbol overlap: %s\n' "$(printf '%s' "$symOverlap" | _join ' | ')"
+        if [[ -n "$clog" ]]; then printf '      changelog hits (%s):\n' "$kw"; printf '%s\n' "$clog" | sed 's/^/          /'; fi
+
+        # ---- report ----
         { echo "### $f — $bucket"; echo
-          echo "- files touched ($nfiles): $(printf '%s' "$filesF" | _join ', ')"
-          if [[ -n "$overlap" ]]; then
-              echo "- ⚠ upstream also changed: $(printf '%s' "$overlap" | _join ', ')"
-              [[ -n "$symOverlap" ]] && echo "- symbol overlap: $(printf '%s' "$symOverlap" | _join ' | ')"
-          else echo "- upstream changes to those files: none"; fi
-          echo "- merge probe: $probe"
-          if [[ -n "$clog" ]]; then echo "- changelog hits (\`$kw\`):"; printf '%s\n' "$clog" | sed 's/^/    - /'
-          else echo "- changelog hits: none"; fi
+          echo "_${rec}_"; echo
+          echo "- files touched: ${nfiles:-0}; overlap: ${noverlap:-0}; owned-in-upstream: $cov; merge: $probe"
+          [[ -n "$reroute_changed" ]] && echo "- reroutes changed by upstream: ${reroute_changed%% }"
+          [[ -n "$moved" ]] && echo "- upstream moved/removed: ${moved%% }"
+          [[ -n "$overlap" ]] && echo "- upstream also changed: $(printf '%s' "$overlap" | _join ', ')"
+          [[ -n "$symOverlap" ]] && echo "- symbol overlap: $(printf '%s' "$symOverlap" | _join ' | ')"
+          if [[ -n "$clog" ]]; then echo "- changelog hits (\`$kw\`):"; printf '%s\n' "$clog" | sed 's/^/    - /'; fi
           echo; } >> "$report"
     done
     rm -rf "$tmpd" 2>/dev/null || true
 
-    printf '\n  %sLegend (Phase 0 — deterministic, no LLM):%s\n' "$c_dim" "$c_off"
+    printf '\n  %sBuckets (Phase 1 — deterministic, no LLM):%s\n' "$c_dim" "$c_off"
     cat <<'LEGEND'
-    INDEPENDENT  no upstream overlap + clean merge — keep as-is.
-    REVIEW       upstream touched the same files/symbols, or a changelog keyword matched.
-                 Classify by hand: covered-by-upstream (retire?) / complementary (integrate) /
-                 hidden-by-your-reroute (forward-port the upstream change).
-    CONFLICT     merge needs a (rerere) resolution — a real update would rerere-resolve or drop it.
+    FULLY_COVERED  upstream now defines ALL the feature's distinctive owned-symbols → retire candidate.
+    GAP_HIDDEN     upstream changed a symbol the feature REROUTES → a clean merge can hide it; forward-port/slim.
+    CONFLICT       merge needs a (rerere) resolution, or upstream moved a file you edit → --teach / re-anchor.
+    COMPLEMENTARY  same region, different purpose (or partial coverage) → keep; re-anchor hunks if needed.
+    INDEPENDENT    no upstream overlap + clean merge → keep as-is.
+    REVIEW         (only when a feature has no probe row) Phase-0 evidence only — add a manifest row.
 LEGEND
     echo; ok "Report: ${report/#$HOME/\~}"
     return 0
