@@ -46,6 +46,8 @@ _SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}"
 PROBES_CONF="${HERMES_PROBES_CONF:-$(dirname "$_SELF")/hermes-feature-probes.conf}"
 # Phase-2 LLM judge helper (only used with --judge). Sibling of this script.
 JUDGE_PY="${HERMES_JUDGE_PY:-$(dirname "$_SELF")/hermes-eval-judge.py}"
+# Phase-3 DRAFT conflict resolver (only used with --teach --draft). Sibling of this script.
+RESOLVE_PY="${HERMES_RESOLVE_PY:-$(dirname "$_SELF")/hermes-resolve-conflict.py}"
 FEATURE_BRANCHES=()
 declare -A REQUIRED=()   # branch -> 1 when annotated "!required" in the conf
 
@@ -63,12 +65,14 @@ DRY_RUN=0
 TEACH_BRANCH=""
 MODE="update"
 JUDGE=0
+DRAFT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run|-n)                DRY_RUN=1 ;;
         --teach)                     TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; }; shift ;;
         --evaluate|--audit-features) MODE="evaluate" ;;
         --judge)                     MODE="evaluate"; JUDGE=1 ;;   # implies --evaluate
+        --draft)                     DRAFT=1 ;;                    # with --teach: LLM-draft each conflict
         "")                          ;;
         *)                           err "unknown argument: $1"; exit 1 ;;
     esac
@@ -433,6 +437,27 @@ if [[ -n "$TEACH_BRANCH" ]]; then
         echo "  conflicted files:"
         git -C "$TWT" diff --name-only --diff-filter=U | sed 's/^/    /'
         echo
+        if (( DRAFT )); then
+            if [[ -x "$VENV_PY" && -f "$RESOLVE_PY" ]]; then
+                ddir="${HERMES_EVAL_DIR:-$HOME/.hermes/eval-reports}/drafts/$san"; mkdir -p "$ddir"
+                say "Draft assist (LLM-proposed resolutions — REVIEW before trusting; written OUTSIDE the worktree so 'git add -A' won't stage them):"
+                while IFS= read -r cf; do
+                    [[ -z "$cf" ]] && continue
+                    draft="$ddir/$cf"; mkdir -p "$(dirname "$draft")"
+                    dsum="$( cd "$REPO" && PYTHONPATH="$REPO" "$VENV_PY" "$RESOLVE_PY" "$TWT/$cf" "$draft" "upstream/HEAD" "$TEACH_BRANCH" 2>/dev/null )"; drc=$?
+                    if (( drc == 0 )) && [[ -s "$draft" ]]; then
+                        printf '    %s✎ %s%s — %s\n' "$c_green" "$cf" "$c_off" "$dsum"
+                        echo "         review: diff \"$TWT/$cf\" \"$draft\""
+                        echo "         apply:  cp \"$draft\" \"$TWT/$cf\""
+                    else
+                        printf '    %s✎ %s%s — no draft (resolver unavailable / unresolved) — resolve manually\n' "$c_yellow" "$cf" "$c_off"
+                    fi
+                done < <(git -C "$TWT" diff --name-only --diff-filter=U)
+                echo
+            else
+                warn "Draft assist requested but resolver or venv missing — resolve manually."
+            fi
+        fi
         echo "  1) cd $TWT"
         echo "  2) resolve the files above, then:  git add -A && git commit --no-edit"
         echo "     (that commit is what records the rerere resolution)"
