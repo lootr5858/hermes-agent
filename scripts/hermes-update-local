@@ -44,6 +44,8 @@ FEATURES_CONF="${HERMES_FEATURES_CONF:-$HOME/.hermes/hermes-features.conf}"
 # so it works both from a worktree and via the ~/.hermes/bin symlink. Override: $HERMES_PROBES_CONF.
 _SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 PROBES_CONF="${HERMES_PROBES_CONF:-$(dirname "$_SELF")/hermes-feature-probes.conf}"
+# Phase-2 LLM judge helper (only used with --judge). Sibling of this script.
+JUDGE_PY="${HERMES_JUDGE_PY:-$(dirname "$_SELF")/hermes-eval-judge.py}"
 FEATURE_BRANCHES=()
 declare -A REQUIRED=()   # branch -> 1 when annotated "!required" in the conf
 
@@ -60,13 +62,18 @@ err()  { printf '%s✗%s %s\n' "$c_red"   "$c_off" "$*" >&2; }
 DRY_RUN=0
 TEACH_BRANCH=""
 MODE="update"
-case "${1:-}" in
-    --dry-run|-n)                DRY_RUN=1 ;;
-    --teach)                     TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; } ;;
-    --evaluate|--audit-features) MODE="evaluate" ;;
-    "")                          ;;
-    *)                           err "unknown argument: $1"; exit 1 ;;
-esac
+JUDGE=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run|-n)                DRY_RUN=1 ;;
+        --teach)                     TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; }; shift ;;
+        --evaluate|--audit-features) MODE="evaluate" ;;
+        --judge)                     MODE="evaluate"; JUDGE=1 ;;   # implies --evaluate
+        "")                          ;;
+        *)                           err "unknown argument: $1"; exit 1 ;;
+    esac
+    shift
+done
 
 WT=""           # candidate worktree path (set later)
 cleanup() {
@@ -217,6 +224,7 @@ run_evaluate() {
     [[ "${PROBE_LOADED:-0}" == 1 ]] \
         && say "Probes manifest: ${PROBES_CONF/#$HOME/\~}" \
         || warn "No probes manifest at ${PROBES_CONF/#$HOME/\~} — Phase-0 evidence only (no 4-bucket classification)."
+    (( JUDGE )) && say "Judge: ON — local LLM adjudication of ambiguous features (configured provider, no tools, fail-closed)."
 
     say "Upstream delta: $(git rev-parse --short "$prev_main") .. $(git rev-parse --short "$upstream_main")  ($behind commit(s) ahead)"
     say "Features: ${FEATURE_BRANCHES[*]}"
@@ -338,6 +346,47 @@ run_evaluate() {
           [[ -n "$symOverlap" ]] && echo "- symbol overlap: $(printf '%s' "$symOverlap" | _join ' | ')"
           if [[ -n "$clog" ]]; then echo "- changelog hits (\`$kw\`):"; printf '%s\n' "$clog" | sed 's/^/    - /'; fi
           echo; } >> "$report"
+
+        # ── Phase 2: optional local LLM judge on the ambiguous buckets ──
+        if (( JUDGE )) && [[ "$bucket" == GAP_HIDDEN || "$bucket" == FULLY_COVERED || "$bucket" == COMPLEMENTARY || "$bucket" == REVIEW ]]; then
+            local ftip jkey jcache jcfile jdir jout jrc
+            ftip="$(git rev-parse "$f" 2>/dev/null)"
+            jcache="$report_dir/.judge-cache"; mkdir -p "$jcache"
+            jkey="$(printf '%s|%s|%s|%s|v1' "$f" "$ftip" "$prev_main" "$upstream_main" | sha256sum 2>/dev/null | cut -c1-16)"
+            jcfile="$jcache/${jkey:-nokey}.txt"
+            if [[ -s "$jcfile" ]]; then
+                printf '    %s⟐ judge (cached):%s %s\n' "$c_dim" "$c_off" "$(sed '1!s/^/      /' "$jcfile")"
+                { echo "- judge (cached):"; sed 's/^/    /' "$jcfile"; echo; } >> "$report"
+            elif [[ -x "$VENV_PY" && -f "$JUDGE_PY" ]]; then
+                jdir="$(mktemp -d -t hermes-judge.XXXXXX)"
+                printf '%s'   "$f"                                     > "$jdir/feature.txt"
+                printf '%s'   "$bucket"                                > "$jdir/bucket.txt"
+                printf '%s'   "${owned:-}"                             > "$jdir/owned.txt"
+                printf '%s'   "${reroutes:-}"                          > "$jdir/reroutes.txt"
+                printf '%s'   "${reroute_changed%% }"                  > "$jdir/reroute_changed.txt"
+                printf '%s'   "$cov"                                   > "$jdir/coverage.txt"
+                printf '%s'   "$(printf '%s' "$overlap" | _join ', ')" > "$jdir/overlap.txt"
+                printf '%s\n' "$clog"                                  > "$jdir/changelog.txt"
+                if [[ -n "$overlap" ]]; then
+                    git diff "$MAIN_BRANCH...$f" -- $overlap           > "$jdir/feature.diff"  2>/dev/null
+                    git diff "$prev_main" "$upstream_main" -- $overlap > "$jdir/upstream.diff" 2>/dev/null
+                else
+                    git diff "$MAIN_BRANCH...$f"                       > "$jdir/feature.diff"  2>/dev/null
+                fi
+                jout="$( cd "$REPO" && PYTHONPATH="$REPO" "$VENV_PY" "$JUDGE_PY" "$jdir" 2>/dev/null )"; jrc=$?
+                if (( jrc == 0 )) && [[ -n "$jout" ]]; then
+                    printf '%s\n' "$jout" > "$jcfile"
+                    printf '    %s⟐ judge:%s %s\n' "$c_blue" "$c_off" "$(printf '%s' "$jout" | sed '1!s/^/      /')"
+                    { echo "- judge:"; printf '%s\n' "$jout" | sed 's/^/    /'; echo; } >> "$report"
+                else
+                    printf '    %s⟐ judge unavailable → NEEDS_HUMAN%s (no provider / call failed)\n' "$c_yellow" "$c_off"
+                    { echo "- judge: unavailable → NEEDS_HUMAN"; echo; } >> "$report"
+                fi
+                rm -rf "$jdir" 2>/dev/null || true
+            else
+                printf '    %s⟐ judge: helper or venv missing → NEEDS_HUMAN%s\n' "$c_yellow" "$c_off"
+            fi
+        fi
     done
     rm -rf "$tmpd" 2>/dev/null || true
 
