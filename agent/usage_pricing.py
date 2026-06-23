@@ -254,6 +254,49 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # OpenAI
     (
         "openai",
+        "gpt-5.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("30.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
+        "gpt-5.5-pro",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("30.00"),
+        output_cost_per_million=Decimal("180.00"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
+        "gpt-5.4",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.50"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.25"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
+        "gpt-5.4-mini",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-05-28",
+    ),
+    (
+        "openai",
         "gpt-4o",
     ): PricingEntry(
         input_cost_per_million=Decimal("2.50"),
@@ -583,7 +626,7 @@ def resolve_billing_route(
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
-    if provider_name == "openai":
+    if provider_name in {"openai", "openai-api"}:
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
@@ -629,19 +672,31 @@ def _normalize_anthropic_model_name(model: str) -> str:
     return name
 
 
+# Trailing Anthropic snapshot date, e.g. "claude-haiku-4-5-20251001" → "-20251001".
+_DATE_SUFFIX_RE = re.compile(r"-\d{8}$")
+
+
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
     model = route.model.lower()
     # Direct lookup first
     entry = _OFFICIAL_DOCS_PRICING.get((route.provider, model))
     if entry:
         return entry
-    # Try normalized name for Anthropic (handles dot-notation like opus-4.7)
+    # Anthropic fallbacks: dot-notation (opus-4.7) and trailing snapshot dates
+    # (e.g. claude-haiku-4-5-20251001) that lack an explicit dated table entry.
     if route.provider == "anthropic":
+        seen = {model}
         normalized = _normalize_anthropic_model_name(model)
-        if normalized != model:
-            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
-            if entry:
-                return entry
+        for cand in (
+            normalized,
+            _DATE_SUFFIX_RE.sub("", model),
+            _DATE_SUFFIX_RE.sub("", normalized),
+        ):
+            if cand and cand not in seen:
+                seen.add(cand)
+                entry = _OFFICIAL_DOCS_PRICING.get((route.provider, cand))
+                if entry:
+                    return entry
     # Bedrock cross-region inference profiles carry a region prefix
     # (us./global./eu./...) that the bare pricing keys don't have.
     if route.provider == "bedrock":
