@@ -2554,6 +2554,7 @@ def _model_flow_anthropic(config, current_model=""):
 
     has_creds = (bool(existing_key) and not existing_is_stale_oauth) or cc_available
     needs_auth = not has_creds
+    selected_auth_mode = None
 
     if has_creds:
         # Show what we found
@@ -2584,6 +2585,8 @@ def _model_flow_anthropic(config, current_model=""):
         elif choice == "cancel":
             return
         # choice == "use" or default: use existing, proceed to model selection
+        elif cc_available and (not existing_key or _is_oauth_token(existing_key)):
+            selected_auth_mode = "subscription_only"
 
     if needs_auth:
         # Show auth method choice
@@ -2603,6 +2606,7 @@ def _model_flow_anthropic(config, current_model=""):
         if choice == "1":
             if not _run_anthropic_oauth_flow(save_env_value):
                 return
+            selected_auth_mode = "subscription_only"
 
         elif choice == "2":
             print()
@@ -2620,6 +2624,7 @@ def _model_flow_anthropic(config, current_model=""):
                 return
             save_anthropic_api_key(api_key, save_fn=save_env_value)
             print("  ✓ API key saved.")
+            selected_auth_mode = "api_key"
 
         else:
             print("  No change.")
@@ -2655,6 +2660,8 @@ def _model_flow_anthropic(config, current_model=""):
         model["provider"] = "anthropic"
         model.pop("base_url", None)
         clear_model_endpoint_credentials(model)
+        if selected_auth_mode:
+            model["auth_mode"] = selected_auth_mode
         save_config(cfg)
         deactivate_provider()
 

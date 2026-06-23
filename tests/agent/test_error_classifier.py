@@ -61,6 +61,7 @@ class TestFailoverReason:
             "provider_policy_blocked",
             "content_policy_blocked",
             "thinking_signature", "long_context_tier",
+            "anthropic_third_party_extra_usage",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
             "unknown",
@@ -795,6 +796,18 @@ class TestClassifyApiError:
         e = MockAPIError("Too Many Requests", status_code=429)
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.rate_limit
+
+    def test_anthropic_third_party_extra_usage_400(self):
+        e = MockAPIError(
+            "Third-party apps now draw from your extra usage, not your plan limits. "
+            "Add more at claude.ai/settings/usage and keep going.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="anthropic", model="claude-sonnet-4-6")
+        assert result.reason == FailoverReason.anthropic_third_party_extra_usage
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
 
     # ── Provider-specific: Anthropic OAuth 1M-context beta forbidden ──
 

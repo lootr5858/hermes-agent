@@ -111,7 +111,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 
 ## Provider Auth (OAuth)
 
-For native Anthropic auth, Hermes prefers Claude Code's own credential files when they exist because those credentials can refresh automatically. **OAuth against Anthropic requires a Claude Max plan with purchased extra usage credits** — Hermes routes as Claude Code, which only draws from the Max plan's extra/overage credits, not the base Max allowance, and does not work on Claude Pro. Without Max + extra credits, use an API key instead. Environment variables such as `ANTHROPIC_TOKEN` remain useful as manual overrides, but they are no longer the preferred path for Claude Max login.
+For native Anthropic subscription auth, set `model.auth_mode: subscription_only`. Hermes then ignores `ANTHROPIC_API_KEY`, `ANTHROPIC_TOKEN`, and `CLAUDE_CODE_OAUTH_TOKEN`, and uses only refreshable Claude Code OAuth credentials from `~/.claude/.credentials.json` / the platform credential store. If Anthropic still returns a third-party extra-usage 400, Hermes reports that as Anthropic-side routing rather than local API-key fallback. Leave `model.auth_mode` unset or set it to `api_key` when you intentionally want pay-per-token API-key billing.
 
 | Variable | Description |
 |----------|-------------|

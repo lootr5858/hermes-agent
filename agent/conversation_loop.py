@@ -2253,6 +2253,31 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
+                if classified.reason == FailoverReason.anthropic_third_party_extra_usage:
+                    _auth_mode = getattr(agent, "_anthropic_auth_mode", "") or "default"
+                    _auth_source = getattr(agent, "_anthropic_auth_source", "") or "unknown"
+                    _ignored = tuple(getattr(agent, "_anthropic_auth_ignored_sources", ()) or ())
+                    _provider_request_id = (
+                        getattr(api_error, "request_id", None)
+                        or getattr(api_error, "_request_id", None)
+                        or ""
+                    )
+                    logger.warning(
+                        "Anthropic third-party extra-usage routing: auth_mode=%s "
+                        "auth_source=%s ignored=%s request_id=%s",
+                        _auth_mode,
+                        _auth_source,
+                        ",".join(_ignored) or "-",
+                        _provider_request_id or "-",
+                    )
+                    agent._vprint(
+                        f"{agent.log_prefix}⚠️  Anthropic routed this Claude request "
+                        f"to third-party extra usage. Local Anthropic auth mode: "
+                        f"{_auth_mode}; source: {_auth_source}. "
+                        f"This indicates Anthropic-side routing, not local API-key fallback."
+                        + (f" request_id={_provider_request_id}" if _provider_request_id else ""),
+                        force=True,
+                    )
                 agent._invoke_api_request_error_hook(
                     task_id=effective_task_id,
                     turn_id=turn_id,
