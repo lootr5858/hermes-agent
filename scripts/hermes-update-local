@@ -318,8 +318,27 @@ run_evaluate() {
                 bucket="CONFLICT"; bcol="$c_yellow"
                 rec="merge has no recorded resolution${moved:+ (upstream MOVED ${moved%% } → re-anchor)}. Run --teach <branch> to record it."
             elif [[ -n "$overlap" || -n "$clog" || "${_cov_n:-0}" -gt 0 ]]; then
-                bucket="COMPLEMENTARY"; bcol="$c_blue"
-                rec="same region, different purpose (or partial coverage) → keep; re-anchor hunks if needed."
+                # COMPLEMENTARY: feature & upstream share a signal. Split by symbol-overlap so
+                # the bucket name implies the action (no secondary field lookup needed):
+                #   _CLEAN  = same file(s) but NO shared enclosing symbol, feature not !required,
+                #             and no softer signal (changelog/partial-coverage) → auto-handle, no ping.
+                #   _REVIEW = shared symbol, OR a !required feature (never auto-classified clean),
+                #             OR a non-file signal without a clear file overlap → surface to Evan.
+                # FOMO not breakage: a wrong _CLEAN means the feature is quietly behind, never broken
+                # (rerere + import smoke-test + !required publish-gate still hold).
+                if [[ -n "$overlap" && -z "$symOverlap" && -z "${REQUIRED[$f]:-}" && -z "$clog" && "${_cov_n:-0}" -eq 0 ]]; then
+                    bucket="COMPLEMENTARY_CLEAN"; bcol="$c_dim"
+                    rec="same file(s) but different symbols (no shared function/class) → clean merge keeps both; no action."
+                else
+                    bucket="COMPLEMENTARY_REVIEW"; bcol="$c_blue"
+                    if [[ -n "$symOverlap" ]]; then
+                        rec="SHARED symbol(s): $(printf '%s' "$symOverlap" | _join ' | ') — a clean merge may freeze the feature on stale upstream logic. Forward-port upstream's change, or accept staying behind."
+                    elif [[ -n "${REQUIRED[$f]:-}" ]]; then
+                        rec="!required feature with same-file overlap — surfaced for a glance (required features are never auto-classified clean). Confirm upstream's change does not affect the feature's region."
+                    else
+                        rec="changelog/partial-coverage signal without a clear shared symbol → glance to confirm no action."
+                    fi
+                fi
             else
                 bucket="INDEPENDENT"; bcol="$c_dim"; rec="no upstream overlap, clean merge → keep as-is."
             fi
@@ -352,7 +371,7 @@ run_evaluate() {
           echo; } >> "$report"
 
         # ── Phase 2: optional local LLM judge on the ambiguous buckets ──
-        if (( JUDGE )) && [[ "$bucket" == GAP_HIDDEN || "$bucket" == FULLY_COVERED || "$bucket" == COMPLEMENTARY || "$bucket" == REVIEW ]]; then
+        if (( JUDGE )) && [[ "$bucket" == GAP_HIDDEN || "$bucket" == FULLY_COVERED || "$bucket" == COMPLEMENTARY_REVIEW || "$bucket" == REVIEW ]]; then
             local ftip jkey jcache jcfile jdir jout jrc
             ftip="$(git rev-parse "$f" 2>/dev/null)"
             jcache="$report_dir/.judge-cache"; mkdir -p "$jcache"
@@ -399,7 +418,8 @@ run_evaluate() {
     FULLY_COVERED  upstream now defines ALL the feature's distinctive owned-symbols → retire candidate.
     GAP_HIDDEN     upstream changed a symbol the feature REROUTES → a clean merge can hide it; forward-port/slim.
     CONFLICT       merge has NO recorded resolution → run --teach (rerere-resolved conflicts auto-apply, not flagged).
-    COMPLEMENTARY  same region, different purpose (or partial coverage) → keep; re-anchor hunks if needed.
+    COMPLEMENTARY_REVIEW  same file AND shared symbol (or a !required feature) → glance/forward-port; may freeze feature on stale logic.
+    COMPLEMENTARY_CLEAN   same file, NO shared symbol, non-required → clean merge keeps both; no action.
     INDEPENDENT    no upstream overlap + clean merge → keep as-is.
     REVIEW         (only when a feature has no probe row) Phase-0 evidence only — add a manifest row.
 LEGEND
