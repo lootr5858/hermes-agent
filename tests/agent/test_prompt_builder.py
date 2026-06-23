@@ -1439,8 +1439,17 @@ class TestToolUseEnforcementGuidance:
         assert "tool call" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
 
     def test_guidance_forbids_description_only(self):
-        assert "describe" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
-        assert "promise" in TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "describe" in text
+        assert "plan to do" in text
+
+    def test_guidance_preserves_approval_boundaries(self):
+        text = TOOL_USE_ENFORCEMENT_GUIDANCE.lower()
+        assert "does not override approval boundaries" in text
+        assert "read-only inspection" in text
+        assert "not mutation" in text
+        assert "persistent/source/config/cron/skill/external-state" in text
+        assert "authorized before execution" in text
 
     def test_guidance_requires_action(self):
         assert "MUST" in TOOL_USE_ENFORCEMENT_GUIDANCE
