@@ -32,6 +32,20 @@ _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
 
 
+def _format_token_count(value: int) -> str:
+    if value < 1000:
+        return str(value)
+    if value < 1_000_000:
+        return f"{value / 1000:.1f}k"
+    return f"{value / 1_000_000:.2f}M"
+
+
+def _format_tokens_io(input_tokens: int, output_tokens: int) -> str:
+    if input_tokens <= 0 and output_tokens <= 0:
+        return ""
+    return f"{_format_token_count(input_tokens)}/{_format_token_count(output_tokens)}"
+
+
 def _home_relative_cwd(cwd: str) -> str:
     """Return *cwd* with ``$HOME`` collapsed to ``~``.  Empty string if unset."""
     if not cwd:
@@ -94,6 +108,8 @@ def format_runtime_footer(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -115,6 +131,10 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "tokens_io":
+            value = _format_tokens_io(input_tokens, output_tokens)
+            if value:
+                parts.append(value)
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -130,6 +150,8 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -145,5 +167,7 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
