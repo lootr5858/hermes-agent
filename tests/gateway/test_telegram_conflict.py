@@ -40,6 +40,7 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 @pytest.fixture(autouse=True)
 def _no_auto_discovery(monkeypatch):
     """Disable DoH auto-discovery so connect() uses the plain builder chain."""
+    monkeypatch.setenv("DISPATCH_ENABLED", "0")
     async def _noop():
         return []
     monkeypatch.setattr("plugins.platforms.telegram.adapter.discover_fallback_ips", _noop)
@@ -47,8 +48,8 @@ def _no_auto_discovery(monkeypatch):
     monkeypatch.setattr("plugins.platforms.telegram.adapter.HTTPXRequest", lambda **kwargs: MagicMock())
 
 
-async def _cancel_heartbeat(adapter):
-    """Cancel the lifetime heartbeat task connect() starts in polling mode.
+async def _cancel_background_tasks(adapter):
+    """Cancel lifetime tasks started by connect().
 
     These tests call the real connect() but never disconnect(), so the
     _polling_heartbeat_loop task would otherwise outlive the test. With
@@ -56,14 +57,15 @@ async def _cancel_heartbeat(adapter):
     event loop and starves the test (CI per-file timeout). disconnect() does
     this in production; tests that only connect() must do it themselves.
     """
-    task = getattr(adapter, "_polling_heartbeat_task", None)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-    adapter._polling_heartbeat_task = None
+    for attr in ("_polling_heartbeat_task", "_dispatch_task"):
+        task = getattr(adapter, attr, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        setattr(adapter, attr, None)
 
 
 @pytest.mark.asyncio
@@ -149,7 +151,7 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
     # connect() now starts a lifetime _polling_heartbeat_loop task. With
     # asyncio.sleep mocked to instant above, it must not be left running or it
     # busy-spins on the event loop and starves the test. Cancel it explicitly.
-    await _cancel_heartbeat(adapter)
+    await _cancel_background_tasks(adapter)
 
 
 @pytest.mark.asyncio
@@ -229,7 +231,7 @@ async def test_polling_conflict_becomes_fatal_after_retries(monkeypatch):
     )
     assert adapter.has_fatal_error is True
     fatal_handler.assert_awaited_once()
-    await _cancel_heartbeat(adapter)
+    await _cancel_background_tasks(adapter)
 
 
 @pytest.mark.asyncio
@@ -310,7 +312,7 @@ async def test_connect_clears_webhook_before_polling(monkeypatch):
 
     assert ok is True
     bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
-    await _cancel_heartbeat(adapter)
+    await _cancel_background_tasks(adapter)
 
 
 @pytest.mark.asyncio
@@ -424,7 +426,7 @@ async def test_polling_conflict_reschedule_uses_running_loop(monkeypatch):
         await adapter._polling_error_task
     except (asyncio.CancelledError, Exception):
         pass
-    await _cancel_heartbeat(adapter)
+    await _cancel_background_tasks(adapter)
 
 
 def _build_polling_app(monkeypatch):
@@ -474,7 +476,7 @@ async def test_cold_connect_drops_pending_updates(monkeypatch):
 
     assert ok is True
     assert captured["drop_pending_updates"] is True
-    await _cancel_heartbeat(adapter)
+    await _cancel_background_tasks(adapter)
 
 
 @pytest.mark.asyncio
@@ -488,7 +490,7 @@ async def test_reconnect_preserves_pending_updates(monkeypatch):
 
     assert ok is True
     assert captured["drop_pending_updates"] is False
-    await _cancel_heartbeat(adapter)
+    await _cancel_background_tasks(adapter)
 
 
 @pytest.mark.asyncio
@@ -597,5 +599,4 @@ async def test_conflict_callback_disarms_before_scheduling(monkeypatch):
     # Drain the scheduled recovery task so it doesn't outlive the test.
     for _ in range(10):
         await asyncio.sleep(0)
-    await _cancel_heartbeat(adapter)
-
+    await _cancel_background_tasks(adapter)
