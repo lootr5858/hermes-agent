@@ -2612,6 +2612,26 @@ class TestKimiTemperatureOmitted:
         assert kwargs["model"] == "kimi-for-coding"
         assert "temperature" not in kwargs
 
+    @pytest.mark.asyncio
+    async def test_async_call_logs_selected_provider_and_model(self, caplog):
+        client = MagicMock()
+        client.base_url = "https://api.kimi.com/coding/v1"
+        client.chat.completions.create = AsyncMock(return_value=MagicMock())
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "kimi-for-coding"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "kimi-for-coding", None, None, None),
+        ), caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+            await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert "Auxiliary session_search (async): using auto (kimi-for-coding)" in caplog.text
+
     @pytest.mark.parametrize(
         "model",
         [
