@@ -201,13 +201,15 @@ def test_evaluator_excludes_upstream_commits_already_in_forward_port(tmp_path: P
     _git(repo, "checkout", "main")
     features.write_text("local/forward-port\n")
     probes = tmp_path / "probes.conf"
-    probes.write_text("local/forward-port | forward port | |\n")
+    probes.write_text("local/forward-port | upstream change | |\n")
     env = _updater_env(repo, features, tmp_path)
     env["HERMES_PROBES_CONF"] = str(probes)
 
     result = _run(UPDATER, "--evaluate", cwd=repo, env=env)
 
     assert result.returncode == 0, result.stdout + result.stderr
+    summary = next(line for line in result.stdout.splitlines() if "→ local/forward-port" in line)
+    assert "[INDEPENDENT]" in re.sub(r"\x1b\[[0-9;]*m", "", summary)
     details = next(line for line in result.stdout.splitlines() if "files " in line)
     assert "files 1 | overlap 0" in details
 

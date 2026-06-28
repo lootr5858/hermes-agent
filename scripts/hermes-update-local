@@ -238,8 +238,6 @@ run_evaluate() {
     say "Upstream delta: $(git rev-parse --short "$prev_main") .. $(git rev-parse --short "$upstream_main")  ($behind commit(s) ahead)"
     say "Features: ${FEATURE_BRANCHES[*]}"
 
-    local changelog; changelog="$(git log --oneline --no-merges "$prev_main..$upstream_main")"
-
     local evwt; evwt="$(mktemp -u -t hermes-eval.XXXXXX)"
     git branch -D _eval >/dev/null 2>&1 || true
     git worktree add --quiet -b _eval "$evwt" "$upstream_main" || { err "could not create eval worktree"; return 1; }
@@ -281,21 +279,21 @@ run_evaluate() {
         if ! git show-ref --verify --quiet "refs/heads/$f"; then
             warn "→ $f — branch missing, skipped."; { echo "### $f — MISSING"; echo; } >> "$report"; continue
         fi
-        local filesF nfiles overlap noverlap symF symUp symOverlap probe kw clog
+        local filesF nfiles overlap noverlap symF symUp symOverlap probe kw clog feature_changelog
         local has_probe owned reroutes updiff reroute_changed moved cov _cov_n _cov_total bucket bcol rec mergedesc
         feature_base="$(git merge-base "$f" "$upstream_main")"
         filesF="$(git diff --name-only "$feature_base..$f" 2>/dev/null)"
         nfiles="$(printf '%s\n' "$filesF" | grep -cve '^$')"
-        overlap=""; [[ -n "$filesF" ]] && overlap="$(git diff --name-only "$prev_main" "$upstream_main" -- $filesF 2>/dev/null | sort -u)"
+        overlap=""; [[ -n "$filesF" ]] && overlap="$(git diff --name-only "$feature_base" "$upstream_main" -- $filesF 2>/dev/null | sort -u)"
         noverlap="$(printf '%s\n' "$overlap" | grep -cve '^$')"
         symOverlap=""
         if [[ -n "$overlap" ]]; then
             symF="$(git diff "$feature_base..$f" -- $overlap 2>/dev/null | hunk_contexts)"
-            symUp="$(git diff "$prev_main" "$upstream_main" -- $overlap 2>/dev/null | hunk_contexts)"
+            symUp="$(git diff "$feature_base" "$upstream_main" -- $overlap 2>/dev/null | hunk_contexts)"
             [[ -n "$symF" && -n "$symUp" ]] && symOverlap="$(printf '%s\n' "$symF" | grep -Fxf <(printf '%s\n' "$symUp"))"
         fi
         probe="$(probe_merge "$evwt" "$f")"
-        moved="$(moved_files_list "$filesF" "$prev_main" "$upstream_main")"
+        moved="$(moved_files_list "$filesF" "$feature_base" "$upstream_main")"
         case "$probe" in
             rerere)   mergedesc="rerere (auto-resolves)" ;;
             conflict) mergedesc="conflict (needs --teach)" ;;
@@ -307,12 +305,13 @@ run_evaluate() {
             kw="$(printf '%s' "${PROBE_KW[$f]}" | sed -E 's/[[:space:]]*,[[:space:]]*/|/g; s/^\|+//; s/\|+$//')"
             owned="${PROBE_OWNED[$f]}"; reroutes="${PROBE_REROUTE[$f]}"
             cov="$(count_owned_in_upstream "$owned" "$upstream_main")"; _cov_n="${cov%/*}"; _cov_total="${cov#*/}"
-            updiff="$(git diff "$prev_main" "$upstream_main" -- $filesF 2>/dev/null)"
+            updiff="$(git diff "$feature_base" "$upstream_main" -- $filesF 2>/dev/null)"
             reroute_changed="$(reroute_changed_list "$reroutes" "$updiff")"
         else
             has_probe=0; kw="$(branch_keywords "${f##*/}")"; cov="0/0"; _cov_n=0; _cov_total=0; reroute_changed=""
         fi
-        clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$changelog" | grep -iE "$kw" 2>/dev/null | head -8)"
+        feature_changelog="$(git log --oneline --no-merges "$feature_base..$upstream_main")"
+        clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$feature_changelog" | grep -iE "$kw" 2>/dev/null | head -8)"
 
         if (( has_probe )); then
             if [[ "$probe" == conflict ]]; then
@@ -382,7 +381,7 @@ run_evaluate() {
             local ftip jkey jcache jcfile jdir jout jrc
             ftip="$(git rev-parse "$f" 2>/dev/null)"
             jcache="$report_dir/.judge-cache"; mkdir -p "$jcache"
-            jkey="$(printf '%s|%s|%s|%s|v1' "$f" "$ftip" "$prev_main" "$upstream_main" | sha256sum 2>/dev/null | cut -c1-16)"
+            jkey="$(printf '%s|%s|%s|%s|v1' "$f" "$ftip" "$feature_base" "$upstream_main" | sha256sum 2>/dev/null | cut -c1-16)"
             jcfile="$jcache/${jkey:-nokey}.txt"
             if [[ -s "$jcfile" ]]; then
                 printf '    %s⟐ judge (cached):%s %s\n' "$c_dim" "$c_off" "$(sed '1!s/^/      /' "$jcfile")"
@@ -399,7 +398,7 @@ run_evaluate() {
                 printf '%s\n' "$clog"                                  > "$jdir/changelog.txt"
                 if [[ -n "$overlap" ]]; then
                     git diff "$feature_base..$f" -- $overlap          > "$jdir/feature.diff"  2>/dev/null
-                    git diff "$prev_main" "$upstream_main" -- $overlap > "$jdir/upstream.diff" 2>/dev/null
+                    git diff "$feature_base" "$upstream_main" -- $overlap > "$jdir/upstream.diff" 2>/dev/null
                 else
                     git diff "$feature_base..$f"                       > "$jdir/feature.diff"  2>/dev/null
                 fi
