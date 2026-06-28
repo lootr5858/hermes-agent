@@ -4004,9 +4004,19 @@ class AIAgent:
             return False
 
         try:
-            from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_credentials,
+                resolve_anthropic_token,
+            )
 
-            new_token = resolve_anthropic_token()
+            auth_mode = getattr(self, "_anthropic_auth_mode", None) or "default"
+            creds = None
+            if auth_mode == "subscription_only":
+                creds = resolve_anthropic_credentials(auth_mode=auth_mode)
+                new_token = creds.token
+            else:
+                new_token = resolve_anthropic_token()
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
@@ -4033,12 +4043,22 @@ class AIAgent:
             return False
 
         self._anthropic_api_key = new_token
+        if creds is not None:
+            self._anthropic_auth_mode = creds.auth_mode
+            self._anthropic_auth_source = creds.source
+            self._anthropic_auth_ignored_sources = tuple(creds.ignored_sources or ())
         # Update OAuth flag — token type may have changed (API key ↔ OAuth).
         # Only treat as OAuth on native Anthropic; third-party endpoints using
         # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
         # identity-injection guard).
         from agent.anthropic_adapter import _is_oauth_token
         self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
+        logger.info(
+            "Anthropic credentials refreshed: mode=%s source=%s ignored=%s",
+            self._anthropic_auth_mode,
+            self._anthropic_auth_source or "-",
+            ",".join(self._anthropic_auth_ignored_sources) or "-",
+        )
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
@@ -4121,7 +4141,21 @@ class AIAgent:
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
 
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_credentials,
+                _is_oauth_token,
+            )
+
+            if (
+                self.provider == "anthropic"
+                and getattr(self, "_anthropic_auth_mode", "") == "subscription_only"
+            ):
+                creds = resolve_anthropic_credentials(auth_mode="subscription_only")
+                runtime_key = creds.token
+                runtime_base = getattr(self, "_anthropic_base_url", None) or runtime_base
+                self._anthropic_auth_source = creds.source
+                self._anthropic_auth_ignored_sources = tuple(creds.ignored_sources)
 
             try:
                 self._anthropic_client.close()

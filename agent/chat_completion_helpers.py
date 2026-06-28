@@ -1308,11 +1308,31 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
-            from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-            effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                get_configured_anthropic_auth_mode,
+                resolve_anthropic_credentials,
+                resolve_anthropic_token,
+                _is_third_party_anthropic_endpoint,
+                _is_oauth_token,
+            )
+            _anthropic_creds = None
+            if fb_provider == "anthropic" and not _is_third_party_anthropic_endpoint(fb_base_url):
+                _auth_mode = get_configured_anthropic_auth_mode()
+                if _auth_mode == "subscription_only":
+                    _anthropic_creds = resolve_anthropic_credentials(auth_mode=_auth_mode)
+                    effective_key = _anthropic_creds.token or ""
+                else:
+                    effective_key = fb_client.api_key or resolve_anthropic_token() or ""
+            else:
+                effective_key = fb_client.api_key or ""
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = fb_base_url
+            if _anthropic_creds is not None:
+                agent._anthropic_auth_mode = _anthropic_creds.auth_mode
+                agent._anthropic_auth_source = _anthropic_creds.source
+                agent._anthropic_auth_ignored_sources = tuple(_anthropic_creds.ignored_sources)
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url, timeout=_fb_timeout,
             )
