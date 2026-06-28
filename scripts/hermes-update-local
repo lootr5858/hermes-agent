@@ -1,0 +1,746 @@
+#!/usr/bin/env bash
+# hermes-update-local (v2) — conflict-safe updater for a custom Hermes fork.
+#
+# Guarantees the live checkout is ALWAYS left on a branch that imports cleanly:
+# either a validated `local/working` or clean `main`. Never a half-merged state.
+#
+# Strategy (see also the matching memory note):
+#   1. Sync official: fetch upstream (Nous), fast-forward main, push the fork mirror.
+#   2. Build a candidate `local/working` in an isolated git worktree, merging each
+#      feature branch one at a time. git rerere auto-resolves known conflicts.
+#   3. Drop ONLY features that conflict (rerere can't resolve) or fail validation;
+#      keep every feature that merges cleanly and still imports.
+#   4. Validate imports after each merge, then run targeted behavior tests once
+#      against the assembled candidate.
+#   5. Publish atomically. Required-feature loss or failed behavior tests aborts
+#      instead of replacing the custom stack with plain main.
+#
+# Usage:
+#   hermes-update-local                    # perform the update
+#   hermes-update-local --dry-run          # show what WOULD happen; no live changes
+#   hermes-update-local --teach <branch>   # prime rerere for a conflicting feature
+#
+# Add/remove your per-function branches via the features config (one branch per
+# line, merge order). Append "  !required" to a branch line to make its loss
+# (conflict / broken import / missing) ABORT the publish instead of silently
+# dropping it — the live checkout is then left untouched. Do NOT rebase feature
+# branches here — they are stable sources; only `working` is regenerated.
+
+set -euo pipefail
+
+# Exit status contract used by the unattended update gate.
+# 0 = safe/success, 10 = valid result requiring human review, 1 = operational error.
+EXIT_REVIEW=10
+
+# ── Config ───────────────────────────────────────────────────────────────────
+REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
+UPSTREAM_REMOTE="upstream"          # NousResearch (fetch-only)
+ORIGIN_REMOTE="origin"             # your fork (push)
+MAIN_BRANCH="main"
+WORKING_BRANCH="local/working"
+VENV_PY="$REPO/venv/bin/python"
+
+# Per-function feature branches are read from a self-documenting config file
+# (one branch per line, in merge order). Edit THAT file to add/remove features —
+# no need to touch this script. Override the path with $HERMES_FEATURES_CONF.
+FEATURES_CONF="${HERMES_FEATURES_CONF:-$HOME/.hermes/hermes-features.conf}"
+# Phase-1 feature metadata for --evaluate (owned/rerouted symbols, topic keywords).
+# Lives beside this script in the repo; located via the script's REAL path (symlink resolved),
+# so it works both from a worktree and via the ~/.hermes/bin symlink. Override: $HERMES_PROBES_CONF.
+_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+PROBES_CONF="${HERMES_PROBES_CONF:-$(dirname "$_SELF")/hermes-feature-probes.conf}"
+# Phase-2 LLM judge helper (only used with --judge). Sibling of this script.
+JUDGE_PY="${HERMES_JUDGE_PY:-$(dirname "$_SELF")/hermes-eval-judge.py}"
+# Phase-3 DRAFT conflict resolver (only used with --teach --draft). Sibling of this script.
+RESOLVE_PY="${HERMES_RESOLVE_PY:-$(dirname "$_SELF")/hermes-resolve-conflict.py}"
+FEATURE_BRANCHES=()
+declare -A REQUIRED=()   # branch -> 1 when annotated "!required" in the conf
+
+# Files whose change implies a dependency reinstall is needed.
+DEP_FILES=(pyproject.toml setup.py setup.cfg requirements.txt uv.lock poetry.lock)
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+c_blue=$'\033[34m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+say()  { printf '%s→%s %s\n' "$c_blue"  "$c_off" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$c_green" "$c_off" "$*"; }
+warn() { printf '%s⚠%s %s\n' "$c_yellow" "$c_off" "$*"; }
+err()  { printf '%s✗%s %s\n' "$c_red"   "$c_off" "$*" >&2; }
+
+DRY_RUN=0
+TEACH_BRANCH=""
+MODE="update"
+JUDGE=0
+DRAFT=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run|-n)                DRY_RUN=1 ;;
+        --teach)                     TEACH_BRANCH="${2:-}"; [[ -z "$TEACH_BRANCH" ]] && { err "--teach requires a branch name"; exit 1; }; shift ;;
+        --evaluate|--audit-features) MODE="evaluate" ;;
+        --judge)                     MODE="evaluate"; JUDGE=1 ;;   # implies --evaluate
+        --draft)                     DRAFT=1 ;;                    # with --teach: LLM-draft each conflict
+        "")                          ;;
+        *)                           err "unknown argument: $1"; exit 1 ;;
+    esac
+    shift
+done
+
+WT=""           # candidate worktree path (set later)
+cleanup() {
+    if [[ -n "$WT" && -d "$WT" ]]; then
+        git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
+    fi
+    git -C "$REPO" branch -D _candidate >/dev/null 2>&1 || true
+    git -C "$REPO" branch -D _eval >/dev/null 2>&1 || true
+    git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# ── Phase-0 evaluation helpers (read-only; shared loader) ────────────────────
+# Feature-list loader, shared by the normal update flow and --evaluate.
+load_features() {
+    if [[ -f "$FEATURES_CONF" ]]; then
+        while IFS= read -r raw || [[ -n "$raw" ]]; do
+            line="${raw#"${raw%%[![:space:]]*}"}"     # ltrim
+            line="${line%"${line##*[![:space:]]}"}"    # rtrim
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            br="${line%%[[:space:]]*}"                 # first token = branch name
+            rest="${line#"$br"}"; rest="${rest#"${rest%%[![:space:]]*}"}"   # annotation, ltrimmed
+            [[ "$rest" == *'!required'* ]] && REQUIRED["$br"]=1
+            FEATURE_BRANCHES+=("$br")
+        done < "$FEATURES_CONF"
+    else
+        warn "Config $FEATURES_CONF not found — no features will be integrated."
+    fi
+}
+
+# join non-blank stdin lines with $1 as the separator
+_join() { awk -v s="$1" 'NF{if(n++)printf "%s",s; printf "%s",$0} END{if(n)print ""}'; }
+
+# unique enclosing-symbol context from a unified diff on stdin (git prints the
+# enclosing def/class after the second @@ on each hunk header)
+hunk_contexts() { grep -E '^@@' | sed -E 's/^@@[^@]*@@[[:space:]]*//; s/[[:space:]]+$//' | grep -vE '^$' | sort -u; }
+
+# branch name -> '|'-joined keyword regex (drop <4-char tokens + stopwords).
+# Phase-0 changelog proxy until hermes-feature-probes.conf lands (Phase 1).
+branch_keywords() {
+    local name="$1" tok; local -a out=(); local oldifs="$IFS"
+    IFS='-'; for tok in $name; do IFS="$oldifs"
+        [[ ${#tok} -lt 4 ]] && { IFS='-'; continue; }
+        case "$tok" in only|with|from|into|this|that|your|true|false) IFS='-'; continue ;; esac
+        out+=("$tok"); IFS='-'
+    done; IFS="$oldifs"
+    ( IFS='|'; printf '%s' "${out[*]:-}" )
+}
+
+# probe a feature merge onto upstream/main in a throwaway worktree, then undo.
+# echoes: clean | rerere | conflict  (reuses rerere => matches publish behavior)
+probe_merge() {
+    local wt="$1" f="$2" base; base="$(git -C "$wt" rev-parse HEAD)"
+    if git -C "$wt" merge --no-edit "$f" >/dev/null 2>&1; then
+        git -C "$wt" reset --hard "$base" >/dev/null 2>&1; echo clean
+    elif [[ -z "$(git -C "$wt" ls-files -u)" ]]; then
+        git -C "$wt" merge --abort >/dev/null 2>&1; git -C "$wt" reset --hard "$base" >/dev/null 2>&1; echo rerere
+    else
+        git -C "$wt" merge --abort >/dev/null 2>&1; git -C "$wt" reset --hard "$base" >/dev/null 2>&1; echo conflict
+    fi
+}
+
+# Parse hermes-feature-probes.conf into PROBE_KW/PROBE_OWNED/PROBE_REROUTE keyed by branch.
+load_probes() {
+    declare -gA PROBE_KW PROBE_OWNED PROBE_REROUTE
+    PROBE_LOADED=0
+    [[ -f "$PROBES_CONF" ]] || return 0
+    PROBE_LOADED=1
+    local raw line br kw owned rr
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        line="${raw%$'\r'}"; line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        IFS='|' read -r br kw owned rr <<< "$line"
+        br="${br//[[:space:]]/}"; [[ -z "$br" ]] && continue
+        kw="${kw#"${kw%%[![:space:]]*}"}"; kw="${kw%"${kw##*[![:space:]]}"}"
+        PROBE_KW["$br"]="$kw"
+        PROBE_OWNED["$br"]="${owned//[[:space:]]/}"
+        PROBE_REROUTE["$br"]="${rr//[[:space:]]/}"
+    done < "$PROBES_CONF"
+}
+
+# How many of a feature's owned-symbols already exist in upstream/main code. Echoes "n/total".
+count_owned_in_upstream() {
+    local owned="$1" up="$2" o n=0 total=0
+    [[ -z "$owned" ]] && { echo "0/0"; return; }
+    local IFS=','
+    for o in $owned; do
+        o="${o//[[:space:]]/}"; [[ -z "$o" ]] && continue
+        total=$((total + 1))
+        git grep -lF "$o" "$up" -- '*.py' >/dev/null 2>&1 && n=$((n + 1))
+    done
+    echo "$n/$total"
+}
+
+# Which rerouted symbols upstream changed (found in the feature's files' upstream diff). Echoes a list.
+reroute_changed_list() {
+    local reroutes="$1" updiff="$2" s out=""
+    [[ -z "$reroutes" ]] && { echo ""; return; }
+    local IFS=','
+    for s in $reroutes; do
+        s="${s//[[:space:]]/}"; [[ -z "$s" ]] && continue
+        printf '%s' "$updiff" | grep -qF "$s" && out+="$s "
+    done
+    echo "$out"
+}
+
+# Feature files that existed in the OLD base but upstream renamed/removed. Echoes a list.
+moved_files_list() {
+    local files="$1" prev="$2" up="$3" file out=""
+    [[ -z "$files" ]] && { echo ""; return; }
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        if git cat-file -e "$prev:$file" 2>/dev/null && ! git cat-file -e "$up:$file" 2>/dev/null; then out+="$file "; fi
+    done <<< "$files"
+    echo "$out"
+}
+
+# ── --evaluate / --audit-features (READ-ONLY) ────────────────────────────────
+# Per custom feature, surface DETERMINISTIC evidence of how it relates to the
+# incoming upstream delta (main..upstream/main): the files/symbols it touches,
+# whether upstream changed the same regions, a merge probe, and changelog
+# keyword hits. No LLM, no network beyond `git fetch`, and it NEVER mutates a
+# tracked branch / the conf / the live checkout — all work happens in a throwaway
+# worktree. Phase-0 buckets: INDEPENDENT / REVIEW / CONFLICT. (Phase 1/2 will
+# split REVIEW into covered / complementary / hidden via a probes manifest and
+# an optional local LLM judge.)
+run_evaluate() {
+    set +e +o pipefail   # read-only reporting; empty greps are expected, not errors
+    cd "$REPO"
+    say "Evaluate mode (READ-ONLY): comparing custom features against the incoming upstream delta."
+    git fetch --quiet "$UPSTREAM_REMOTE" || { err "fetch $UPSTREAM_REMOTE failed"; return 1; }
+    git fetch --quiet "$ORIGIN_REMOTE" 2>/dev/null || true
+
+    local upstream_main prev_main behind
+    upstream_main="$(git rev-parse "$UPSTREAM_REMOTE/$MAIN_BRANCH")"
+    prev_main="$(git rev-parse "$MAIN_BRANCH")"
+    if [[ "$prev_main" == "$upstream_main" ]]; then
+        ok "main is already at $UPSTREAM_REMOTE/$MAIN_BRANCH ($(git rev-parse --short "$upstream_main")) — no upstream delta to evaluate."
+        return 0
+    fi
+    git merge-base --is-ancestor "$prev_main" "$upstream_main" \
+        || warn "main is not fast-forwardable to upstream/main (diverged) — evaluating the delta regardless."
+    behind="$(git rev-list --count "$prev_main..$upstream_main")"
+
+    load_features
+    if (( ${#FEATURE_BRANCHES[@]} == 0 )); then warn "No feature branches configured — nothing to evaluate."; return 0; fi
+    load_probes
+    [[ "${PROBE_LOADED:-0}" == 1 ]] \
+        && say "Probes manifest: ${PROBES_CONF/#$HOME/\~}" \
+        || warn "No probes manifest at ${PROBES_CONF/#$HOME/\~} — Phase-0 evidence only (no 4-bucket classification)."
+    (( JUDGE )) && say "Judge: ON — local LLM adjudication of ambiguous features (configured provider, no tools, fail-closed)."
+
+    say "Upstream delta: $(git rev-parse --short "$prev_main") .. $(git rev-parse --short "$upstream_main")  ($behind commit(s) ahead)"
+    say "Features: ${FEATURE_BRANCHES[*]}"
+
+    local evwt; evwt="$(mktemp -u -t hermes-eval.XXXXXX)"
+    git branch -D _eval >/dev/null 2>&1 || true
+    git worktree add --quiet -b _eval "$evwt" "$upstream_main" || { err "could not create eval worktree"; return 1; }
+    WT="$evwt"   # hand to the EXIT-trap cleanup
+
+    local report_dir="${HERMES_EVAL_DIR:-$HOME/.hermes/eval-reports}"
+    mkdir -p "$report_dir"
+    local report="$report_dir/REPORT-$(git rev-parse --short "$upstream_main").md"
+    { echo "# hermes feature evaluation (Phase 1)"; echo
+      echo "- delta: \`$(git rev-parse --short "$prev_main")\` .. \`$(git rev-parse --short "$upstream_main")\` ($behind commits)"
+      echo; } > "$report"
+
+    # intra-fork file-collision matrix (independent of upstream)
+    local tmpd; tmpd="$(mktemp -d -t hermes-eval-files.XXXXXX)"; local f feature_base
+    for f in "${FEATURE_BRANCHES[@]}"; do
+        git show-ref --verify --quiet "refs/heads/$f" || continue
+        feature_base="$(git merge-base "$f" "$upstream_main")"
+        git diff --name-only "$feature_base..$f" > "$tmpd/${f//\//-}.files" 2>/dev/null
+    done
+    echo; say "Intra-fork file collisions (same file touched by >1 feature):"
+    { echo "## intra-fork file collisions"; echo; } >> "$report"
+    local collided; collided="$(cat "$tmpd"/*.files 2>/dev/null | sort | uniq -d)"
+    if [[ -n "$collided" ]]; then
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local owners=""
+            for f in "${FEATURE_BRANCHES[@]}"; do
+                [[ -f "$tmpd/${f//\//-}.files" ]] && grep -qxF "$file" "$tmpd/${f//\//-}.files" && owners+="${f##*/} "
+            done
+            printf '   %-46s ← %s\n' "$file" "$owners"; echo "- \`$file\` ← $owners" >> "$report"
+        done <<< "$collided"
+    else
+        echo "   (none)"; echo "_(none)_" >> "$report"
+    fi
+
+    # per-feature classification (Phase 1)
+    echo; { echo; echo "## per-feature classification"; echo; } >> "$report"
+    for f in "${FEATURE_BRANCHES[@]}"; do
+        if ! git show-ref --verify --quiet "refs/heads/$f"; then
+            warn "→ $f — branch missing, skipped."; { echo "### $f — MISSING"; echo; } >> "$report"; continue
+        fi
+        local filesF nfiles overlap noverlap symF symUp symOverlap probe kw clog feature_changelog
+        local has_probe owned reroutes updiff reroute_changed moved cov _cov_n _cov_total bucket bcol rec mergedesc
+        feature_base="$(git merge-base "$f" "$upstream_main")"
+        filesF="$(git diff --name-only "$feature_base..$f" 2>/dev/null)"
+        nfiles="$(printf '%s\n' "$filesF" | grep -cve '^$')"
+        overlap=""; [[ -n "$filesF" ]] && overlap="$(git diff --name-only "$feature_base" "$upstream_main" -- $filesF 2>/dev/null | sort -u)"
+        noverlap="$(printf '%s\n' "$overlap" | grep -cve '^$')"
+        symOverlap=""
+        if [[ -n "$overlap" ]]; then
+            symF="$(git diff "$feature_base..$f" -- $overlap 2>/dev/null | hunk_contexts)"
+            symUp="$(git diff "$feature_base" "$upstream_main" -- $overlap 2>/dev/null | hunk_contexts)"
+            [[ -n "$symF" && -n "$symUp" ]] && symOverlap="$(printf '%s\n' "$symF" | grep -Fxf <(printf '%s\n' "$symUp"))"
+        fi
+        probe="$(probe_merge "$evwt" "$f")"
+        moved="$(moved_files_list "$filesF" "$feature_base" "$upstream_main")"
+        case "$probe" in
+            rerere)   mergedesc="rerere (auto-resolves)" ;;
+            conflict) mergedesc="conflict (needs --teach)" ;;
+            *)        mergedesc="$probe" ;;
+        esac
+
+        if [[ -n "${PROBE_KW[$f]+x}" ]]; then
+            has_probe=1
+            kw="$(printf '%s' "${PROBE_KW[$f]}" | sed -E 's/[[:space:]]*,[[:space:]]*/|/g; s/^\|+//; s/\|+$//')"
+            owned="${PROBE_OWNED[$f]}"; reroutes="${PROBE_REROUTE[$f]}"
+            cov="$(count_owned_in_upstream "$owned" "$upstream_main")"; _cov_n="${cov%/*}"; _cov_total="${cov#*/}"
+            updiff="$(git diff "$feature_base" "$upstream_main" -- $filesF 2>/dev/null)"
+            reroute_changed="$(reroute_changed_list "$reroutes" "$updiff")"
+        else
+            has_probe=0; kw="$(branch_keywords "${f##*/}")"; cov="0/0"; _cov_n=0; _cov_total=0; reroute_changed=""
+        fi
+        feature_changelog="$(git log --oneline --no-merges "$feature_base..$upstream_main")"
+        clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$feature_changelog" | grep -iE "$kw" 2>/dev/null | head -8)"
+
+        if (( has_probe )); then
+            if [[ "$probe" == conflict ]]; then
+                bucket="CONFLICT"; bcol="$c_yellow"
+                rec="merge has no recorded resolution${moved:+ (upstream MOVED ${moved%% } → re-anchor)}. Forward-port or teach it."
+            elif (( _cov_total > 0 && _cov_n == _cov_total )); then
+                bucket="FULLY_COVERED"; bcol="$c_green"
+                rec="upstream now defines ALL the feature's distinctive symbols → RETIRE candidate (confirm, then drop from the features conf — never auto-retired)."
+            elif [[ -n "$reroute_changed" ]]; then
+                bucket="GAP_HIDDEN"; bcol="$c_red"
+                rec="upstream changed symbol(s) you reroute (${reroute_changed%% }) — a clean merge can HIDE that change. Forward-port it, or slim the feature."
+            elif [[ -n "$overlap" || -n "$clog" || "${_cov_n:-0}" -gt 0 ]]; then
+                # COMPLEMENTARY: feature & upstream share a signal. Split by symbol-overlap so
+                # the bucket name implies the action (no secondary field lookup needed):
+                #   _CLEAN  = same file(s) but NO shared enclosing symbol, feature not !required,
+                #             and no softer signal (changelog/partial-coverage) → auto-handle, no ping.
+                #   _REVIEW = shared symbol, OR a !required feature (never auto-classified clean),
+                #             OR a non-file signal without a clear file overlap → surface to Evan.
+                # FOMO not breakage: a wrong _CLEAN means the feature is quietly behind, never broken
+                # (rerere + import smoke-test + !required publish-gate still hold).
+                if [[ -n "$overlap" && -z "$symOverlap" && -z "${REQUIRED[$f]:-}" && -z "$clog" && "${_cov_n:-0}" -eq 0 ]]; then
+                    bucket="COMPLEMENTARY_CLEAN"; bcol="$c_dim"
+                    rec="same file(s) but different symbols (no shared function/class) → clean merge keeps both; no action."
+                else
+                    bucket="COMPLEMENTARY_REVIEW"; bcol="$c_blue"
+                    if [[ -n "$symOverlap" ]]; then
+                        rec="SHARED symbol(s): $(printf '%s' "$symOverlap" | _join ' | ') — a clean merge may freeze the feature on stale upstream logic. Forward-port upstream's change, or accept staying behind."
+                    elif [[ -n "${REQUIRED[$f]:-}" ]]; then
+                        rec="!required feature with same-file overlap — surfaced for a glance (required features are never auto-classified clean). Confirm upstream's change does not affect the feature's region."
+                    else
+                        rec="changelog/partial-coverage signal without a clear shared symbol → glance to confirm no action."
+                    fi
+                fi
+            else
+                bucket="INDEPENDENT"; bcol="$c_dim"; rec="no upstream overlap, clean merge → keep as-is."
+            fi
+        else
+            if [[ "$probe" == conflict ]]; then bucket="CONFLICT"; bcol="$c_yellow"
+            elif [[ -n "$overlap" || -n "$clog" ]]; then bucket="REVIEW"; bcol="$c_yellow"
+            else bucket="INDEPENDENT"; bcol="$c_dim"; fi
+            rec="(no probe row — add one to ${PROBES_CONF##*/} for full classification)"
+        fi
+
+        # ---- stdout ----
+        printf '\n%s→ %s%s   [%s%s%s]\n' "$c_blue" "$f" "$c_off" "$bcol" "$bucket" "$c_off"
+        printf '    %s%s%s\n' "$c_dim" "$rec" "$c_off"
+        printf '    files %s | overlap %s | owned-in-upstream %s | merge %s%s%s\n' \
+            "${nfiles:-0}" "${noverlap:-0}" "$cov" "$mergedesc" \
+            "${reroute_changed:+ | reroutes-changed: ${reroute_changed%% }}" "${moved:+ | moved: ${moved%% }}"
+        [[ -n "$overlap" ]] && printf '      upstream also changed: %s\n' "$(printf '%s' "$overlap" | _join ', ')"
+        [[ -n "$symOverlap" ]] && printf '      symbol overlap: %s\n' "$(printf '%s' "$symOverlap" | _join ' | ')"
+        if [[ -n "$clog" ]]; then printf '      changelog hits (%s):\n' "$kw"; printf '%s\n' "$clog" | sed 's/^/          /'; fi
+
+        # ---- report ----
+        { echo "### $f — $bucket"; echo
+          echo "_${rec}_"; echo
+          echo "- files touched: ${nfiles:-0}; overlap: ${noverlap:-0}; owned-in-upstream: $cov; merge: $mergedesc"
+          [[ -n "$reroute_changed" ]] && echo "- reroutes changed by upstream: ${reroute_changed%% }"
+          [[ -n "$moved" ]] && echo "- upstream moved/removed: ${moved%% }"
+          [[ -n "$overlap" ]] && echo "- upstream also changed: $(printf '%s' "$overlap" | _join ', ')"
+          [[ -n "$symOverlap" ]] && echo "- symbol overlap: $(printf '%s' "$symOverlap" | _join ' | ')"
+          if [[ -n "$clog" ]]; then echo "- changelog hits (\`$kw\`):"; printf '%s\n' "$clog" | sed 's/^/    - /'; fi
+          echo; } >> "$report"
+
+        # ── Phase 2: optional local LLM judge on the ambiguous buckets ──
+        if (( JUDGE )) && [[ "$bucket" == GAP_HIDDEN || "$bucket" == FULLY_COVERED || "$bucket" == COMPLEMENTARY_REVIEW || "$bucket" == REVIEW ]]; then
+            local ftip jkey jcache jcfile jdir jout jrc
+            ftip="$(git rev-parse "$f" 2>/dev/null)"
+            jcache="$report_dir/.judge-cache"; mkdir -p "$jcache"
+            jkey="$(printf '%s|%s|%s|%s|v1' "$f" "$ftip" "$feature_base" "$upstream_main" | sha256sum 2>/dev/null | cut -c1-16)"
+            jcfile="$jcache/${jkey:-nokey}.txt"
+            if [[ -s "$jcfile" ]]; then
+                printf '    %s⟐ judge (cached):%s %s\n' "$c_dim" "$c_off" "$(sed '1!s/^/      /' "$jcfile")"
+                { echo "- judge (cached):"; sed 's/^/    /' "$jcfile"; echo; } >> "$report"
+            elif [[ -x "$VENV_PY" && -f "$JUDGE_PY" ]]; then
+                jdir="$(mktemp -d -t hermes-judge.XXXXXX)"
+                printf '%s'   "$f"                                     > "$jdir/feature.txt"
+                printf '%s'   "$bucket"                                > "$jdir/bucket.txt"
+                printf '%s'   "${owned:-}"                             > "$jdir/owned.txt"
+                printf '%s'   "${reroutes:-}"                          > "$jdir/reroutes.txt"
+                printf '%s'   "${reroute_changed%% }"                  > "$jdir/reroute_changed.txt"
+                printf '%s'   "$cov"                                   > "$jdir/coverage.txt"
+                printf '%s'   "$(printf '%s' "$overlap" | _join ', ')" > "$jdir/overlap.txt"
+                printf '%s\n' "$clog"                                  > "$jdir/changelog.txt"
+                if [[ -n "$overlap" ]]; then
+                    git diff "$feature_base..$f" -- $overlap          > "$jdir/feature.diff"  2>/dev/null
+                    git diff "$feature_base" "$upstream_main" -- $overlap > "$jdir/upstream.diff" 2>/dev/null
+                else
+                    git diff "$feature_base..$f"                       > "$jdir/feature.diff"  2>/dev/null
+                fi
+                jout="$( cd "$REPO" && PYTHONPATH="$REPO" "$VENV_PY" "$JUDGE_PY" "$jdir" 2>/dev/null )"; jrc=$?
+                if (( jrc == 0 )) && [[ -n "$jout" ]]; then
+                    printf '%s\n' "$jout" > "$jcfile"
+                    printf '    %s⟐ judge:%s %s\n' "$c_blue" "$c_off" "$(printf '%s' "$jout" | sed '1!s/^/      /')"
+                    { echo "- judge:"; printf '%s\n' "$jout" | sed 's/^/    /'; echo; } >> "$report"
+                else
+                    printf '    %s⟐ judge unavailable → NEEDS_HUMAN%s (no provider / call failed)\n' "$c_yellow" "$c_off"
+                    { echo "- judge: unavailable → NEEDS_HUMAN"; echo; } >> "$report"
+                fi
+                rm -rf "$jdir" 2>/dev/null || true
+            else
+                printf '    %s⟐ judge: helper or venv missing → NEEDS_HUMAN%s\n' "$c_yellow" "$c_off"
+            fi
+        fi
+    done
+    rm -rf "$tmpd" 2>/dev/null || true
+
+    printf '\n  %sBuckets (Phase 1 — deterministic, no LLM):%s\n' "$c_dim" "$c_off"
+    cat <<'LEGEND'
+    FULLY_COVERED  upstream now defines ALL the feature's distinctive owned-symbols → retire candidate.
+    GAP_HIDDEN     upstream changed a symbol the feature REROUTES → a clean merge can hide it; forward-port/slim.
+    CONFLICT       merge has NO recorded resolution → run --teach (rerere-resolved conflicts auto-apply, not flagged).
+    COMPLEMENTARY_REVIEW  same file AND shared symbol (or a !required feature) → glance/forward-port; may freeze feature on stale logic.
+    COMPLEMENTARY_CLEAN   same file, NO shared symbol, non-required → clean merge keeps both; no action.
+    INDEPENDENT    no upstream overlap + clean merge → keep as-is.
+    REVIEW         (only when a feature has no probe row) Phase-0 evidence only — add a manifest row.
+LEGEND
+    echo; ok "Report: ${report/#$HOME/\~}"
+    return 0
+}
+
+if [[ "$MODE" == "evaluate" ]]; then run_evaluate; exit $?; fi
+
+# ── --teach <branch>: prime rerere for a conflicting feature ──────────────────
+# Sets up the exact merge (feature onto upstream/main) in an isolated worktree so
+# you resolve the conflict ONCE; your commit records the rerere resolution, which
+# the next update auto-applies. Touches neither the live checkout nor any branch
+# the agent runs on.
+if [[ -n "$TEACH_BRANCH" ]]; then
+    cd "$REPO"
+    say "Teach mode: priming rerere for $TEACH_BRANCH against $UPSTREAM_REMOTE/$MAIN_BRANCH"
+    git fetch --quiet "$UPSTREAM_REMOTE"
+    git show-ref --verify --quiet "refs/heads/$TEACH_BRANCH" || { err "branch '$TEACH_BRANCH' not found"; exit 1; }
+    san="${TEACH_BRANCH//\//-}"
+    TWT="$(mktemp -u -t hermes-teach-"$san".XXXXXX)"
+    git branch -D "_teach_$san" >/dev/null 2>&1 || true
+    git worktree add --quiet -b "_teach_$san" "$TWT" "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+
+    # Reproduce the configured stack up to the target. Teaching directly on
+    # upstream/main can record the wrong resolution when earlier features touch
+    # the same files.
+    load_features
+    target_configured=0
+    for predecessor in "${FEATURE_BRANCHES[@]}"; do
+        if [[ "$predecessor" == "$TEACH_BRANCH" ]]; then
+            target_configured=1
+            break
+        fi
+        git show-ref --verify --quiet "refs/heads/$predecessor" || { err "configured predecessor '$predecessor' not found"; exit 1; }
+        if git -C "$TWT" merge --no-edit "$predecessor" >/dev/null 2>&1; then
+            continue
+        elif [[ -z "$(git -C "$TWT" ls-files -u)" ]] && git -C "$TWT" commit --no-edit >/dev/null 2>&1; then
+            continue
+        fi
+        git -C "$TWT" merge --abort >/dev/null 2>&1 || true
+        err "configured predecessor '$predecessor' conflicts before $TEACH_BRANCH"
+        err "Resolve/forward-port that predecessor first; target teaching was not started."
+        exit "$EXIT_REVIEW"
+    done
+    (( target_configured )) || warn "$TEACH_BRANCH is not in $FEATURES_CONF; teaching directly on upstream/main."
+
+    if git -C "$TWT" merge --no-edit "$TEACH_BRANCH" >/dev/null 2>&1; then
+        ok "$TEACH_BRANCH merges cleanly onto $UPSTREAM_REMOTE/$MAIN_BRANCH — nothing to teach."
+        git worktree remove --force "$TWT" >/dev/null 2>&1 || true
+        git branch -D "_teach_$san" >/dev/null 2>&1 || true
+    elif [[ -z "$(git -C "$TWT" ls-files -u)" ]]; then
+        git -C "$TWT" commit --no-edit >/dev/null 2>&1 || true
+        ok "rerere already resolves this — re-affirmed. Nothing more to teach."
+        git worktree remove --force "$TWT" >/dev/null 2>&1 || true
+        git branch -D "_teach_$san" >/dev/null 2>&1 || true
+    else
+        warn "Conflict — resolve it once to teach rerere:"
+        echo "  conflicted files:"
+        git -C "$TWT" diff --name-only --diff-filter=U | sed 's/^/    /'
+        echo
+        if (( DRAFT )); then
+            if [[ -x "$VENV_PY" && -f "$RESOLVE_PY" ]]; then
+                ddir="${HERMES_EVAL_DIR:-$HOME/.hermes/eval-reports}/drafts/$san"; mkdir -p "$ddir"
+                say "Draft assist (LLM-proposed resolutions — REVIEW before trusting; written OUTSIDE the worktree so 'git add -A' won't stage them):"
+                while IFS= read -r cf; do
+                    [[ -z "$cf" ]] && continue
+                    draft="$ddir/$cf"; mkdir -p "$(dirname "$draft")"
+                    dsum="$( cd "$REPO" && PYTHONPATH="$REPO" "$VENV_PY" "$RESOLVE_PY" "$TWT/$cf" "$draft" "upstream/HEAD" "$TEACH_BRANCH" 2>/dev/null )"; drc=$?
+                    if (( drc == 0 )) && [[ -s "$draft" ]]; then
+                        printf '    %s✎ %s%s — %s\n' "$c_green" "$cf" "$c_off" "$dsum"
+                        echo "         review: diff \"$TWT/$cf\" \"$draft\""
+                        echo "         apply:  cp \"$draft\" \"$TWT/$cf\""
+                    else
+                        printf '    %s✎ %s%s — no draft (resolver unavailable / unresolved) — resolve manually\n' "$c_yellow" "$cf" "$c_off"
+                    fi
+                done < <(git -C "$TWT" diff --name-only --diff-filter=U)
+                echo
+            else
+                warn "Draft assist requested but resolver or venv missing — resolve manually."
+            fi
+        fi
+        echo "  1) cd $TWT"
+        echo "  2) resolve the files above, then:  git add -A && git commit --no-edit"
+        echo "     (that commit is what records the rerere resolution)"
+        echo "  3) clean up:  git -C \"$REPO\" worktree remove \"$TWT\" && git -C \"$REPO\" branch -D _teach_$san"
+        echo
+        say "After step 2, the next 'hermes-update-local' auto-applies it and keeps $TEACH_BRANCH."
+    fi
+    exit 0
+fi
+
+# Import smoke test against a given checkout dir. Catches syntax errors and
+# import-time failures (the exact class of breakage that crashed the CLI before).
+smoke_test() {
+    local dir="$1"
+    ( cd "$dir" && PYTHONPATH="$dir" "$VENV_PY" -c "import run_agent" ) >/dev/null 2>&1
+}
+
+# Small behavior suite for custom features. Run once on the assembled candidate;
+# per-feature imports above remain the cheap first-pass check.
+TARGETED_TESTS=(
+    tests/agent/test_anthropic_subscription_only.py
+    tests/agent/test_auxiliary_client.py
+    tests/agent/test_prompt_builder.py
+    tests/gateway/test_runtime_footer.py
+    tests/gateway/test_telegram_dispatch_handoff.py
+)
+validate_candidate() {
+    local dir="$1" test_path
+    local -a present=()
+    smoke_test "$dir" || return 1
+    [[ -x "$dir/scripts/run_tests.sh" ]] || return 0
+    for test_path in "${TARGETED_TESTS[@]}"; do
+        [[ -f "$dir/$test_path" ]] && present+=("$test_path")
+    done
+    (( ${#present[@]} == 0 )) && return 0
+    TARGETED_TESTS_RUN="${present[*]}"
+    ( cd "$dir" && scripts/run_tests.sh "${present[@]}" ) >/dev/null 2>&1
+}
+
+# ── 0. Pre-flight ────────────────────────────────────────────────────────────
+cd "$REPO"
+[[ -x "$VENV_PY" ]] || { err "venv python not found at $VENV_PY"; exit 1; }
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    err "Working tree is dirty. Commit/stash changes before updating."
+    git status --short
+    exit 1
+fi
+START_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+git branch -D _candidate >/dev/null 2>&1 || true
+
+(( DRY_RUN )) && warn "DRY RUN — no live branches, pushes, or checkouts will change."
+
+# ── Load feature list from config ────────────────────────────────────────────
+load_features
+if (( ${#FEATURE_BRANCHES[@]} == 0 )); then
+    warn "No feature branches configured — update will produce plain $MAIN_BRANCH only."
+else
+    say "Features (from ${FEATURES_CONF/#$HOME/\~}): ${FEATURE_BRANCHES[*]}"
+fi
+
+# ── 1. Fetch official (read-only) ────────────────────────────────────────────
+say "Fetching $UPSTREAM_REMOTE (Nous) and $ORIGIN_REMOTE (fork)..."
+git fetch --quiet "$UPSTREAM_REMOTE"
+git fetch --quiet "$ORIGIN_REMOTE" || true
+
+UPSTREAM_MAIN="$(git rev-parse "$UPSTREAM_REMOTE/$MAIN_BRANCH")"
+LOCAL_MAIN="$(git rev-parse "$MAIN_BRANCH")"
+PREV_MAIN="$LOCAL_MAIN"
+
+if [[ "$LOCAL_MAIN" == "$UPSTREAM_MAIN" ]]; then
+    ok "main already up to date ($(git rev-parse --short "$UPSTREAM_MAIN"))."
+elif git merge-base --is-ancestor "$LOCAL_MAIN" "$UPSTREAM_MAIN"; then
+    ok "main is behind by $(git rev-list --count "$MAIN_BRANCH..$UPSTREAM_REMOTE/$MAIN_BRANCH") commit(s) — fast-forwardable to $(git rev-parse --short "$UPSTREAM_MAIN")."
+else
+    err "Local main has diverged from $UPSTREAM_REMOTE/$MAIN_BRANCH (not fast-forwardable)."
+    err "Refusing to touch it. Inspect manually."
+    exit 1
+fi
+
+# Did dependency files change between current main and upstream?
+DEPS_CHANGED=0
+if [[ "$LOCAL_MAIN" != "$UPSTREAM_MAIN" ]]; then
+    if [[ -n "$(git diff --name-only "$LOCAL_MAIN" "$UPSTREAM_MAIN" -- "${DEP_FILES[@]}" 2>/dev/null)" ]]; then
+        DEPS_CHANGED=1
+    fi
+fi
+
+# ── 2. Build candidate working in an isolated worktree ───────────────────────
+say "Building candidate $WORKING_BRANCH from $UPSTREAM_REMOTE/$MAIN_BRANCH (isolated worktree)..."
+WT="$(mktemp -u -t hermes-cand.XXXXXX)"
+git worktree add --quiet -b _candidate "$WT" "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+
+KEPT=(); DROPPED=(); REQUIRED_DROPPED=(); CONFLICT_DROPPED=()
+note_drop() { [[ -n "${REQUIRED[$1]:-}" ]] && REQUIRED_DROPPED+=("$1"); return 0; }   # flag required losses (must return 0 under set -e)
+for f in "${FEATURE_BRANCHES[@]}"; do
+    if ! git -C "$WT" show-ref --verify --quiet "refs/heads/$f"; then
+        warn "  $f — branch missing, skipping."
+        DROPPED+=("$f (missing)"); note_drop "$f"
+        continue
+    fi
+    before="$(git -C "$WT" rev-parse HEAD)"
+    merged_ok=0
+    if git -C "$WT" merge --no-edit "$f" >/dev/null 2>&1; then
+        merged_ok=1                                   # clean merge
+    elif [[ -z "$(git -C "$WT" ls-files -u)" ]]; then
+        # No unmerged entries left → rerere resolved everything; finish the merge.
+        if git -C "$WT" commit --no-edit >/dev/null 2>&1; then
+            merged_ok=1
+            printf '%s  rerere auto-resolved a conflict in %s%s\n' "$c_dim" "$f" "$c_off"
+        fi
+    fi
+
+    if (( ! merged_ok )); then
+        git -C "$WT" merge --abort >/dev/null 2>&1 || git -C "$WT" reset --hard "$before" >/dev/null 2>&1
+        warn "  $f — unresolved conflict, DROPPED."
+        DROPPED+=("$f (conflict)"); CONFLICT_DROPPED+=("$f"); note_drop "$f"
+        continue
+    fi
+
+    if smoke_test "$WT"; then
+        ok "  $f — merged & imports clean."
+        KEPT+=("$f")
+    else
+        git -C "$WT" reset --hard "$before" >/dev/null 2>&1
+        warn "  $f — merged but import smoke test FAILED, DROPPED."
+        DROPPED+=("$f (broken import)"); note_drop "$f"
+    fi
+done
+
+# Final guard: candidate must import even with all kept features.
+CANDIDATE_OK=0
+VALIDATION_FAILED=0
+TARGETED_TESTS_RUN=""
+if (( ${#KEPT[@]} > 0 )); then
+    if validate_candidate "$WT"; then
+        CANDIDATE_OK=1
+    else
+        VALIDATION_FAILED=1
+    fi
+fi
+CANDIDATE_SHA="$(git -C "$WT" rev-parse HEAD)"
+
+# ── 3. Decide & apply ────────────────────────────────────────────────────────
+echo
+say "Summary:"
+printf '   kept    : %s\n' "${KEPT[*]:-(none)}"
+printf '   dropped : %s\n' "${DROPPED[*]:-(none)}"
+(( DEPS_CHANGED )) && printf '   deps    : %schanged in upstream — reinstall needed%s\n' "$c_yellow" "$c_off"
+
+# Staleness guard: a conflict drop means rerere had no matching resolution.
+# Surface it loudly and actionably so it's never a silent loss.
+if (( ${#CONFLICT_DROPPED[@]} > 0 )); then
+    echo
+    warn "Unresolved conflicts (no rerere resolution) — these were EXCLUDED:"
+    printf '     %s\n' "${CONFLICT_DROPPED[@]}"
+    echo "   Re-teach each, then re-run:  hermes-update-local --teach <branch>"
+fi
+
+# Required-feature guard: a dropped !required feature must block the publish.
+if (( ${#REQUIRED_DROPPED[@]} > 0 )); then
+    echo
+    err "REQUIRED feature(s) did not survive: ${REQUIRED_DROPPED[*]}"
+    if (( DRY_RUN )); then
+        warn "DRY RUN: would ABORT publish and keep current $WORKING_BRANCH unchanged."
+        say "DRY RUN complete. No live changes made. Still on: $START_BRANCH"
+    else
+        err "Refusing to publish a degraded $WORKING_BRANCH. Live checkout left untouched on $START_BRANCH."
+        err "Teach the resolution, then re-run:  hermes-update-local --teach ${REQUIRED_DROPPED[0]}"
+    fi
+    exit "$EXIT_REVIEW"
+fi
+
+# Never replace a custom stack with plain main because its assembled behavior
+# tests failed. That is a review result, not a valid fallback candidate.
+if (( VALIDATION_FAILED )); then
+    echo
+    err "Candidate targeted validation failed${TARGETED_TESTS_RUN:+: $TARGETED_TESTS_RUN}"
+    if (( DRY_RUN )); then
+        warn "DRY RUN: would ABORT publish and keep current $WORKING_BRANCH unchanged."
+    else
+        err "Refusing to publish or fall back to plain $MAIN_BRANCH. Live checkout left untouched."
+    fi
+    exit "$EXIT_REVIEW"
+fi
+
+if (( DRY_RUN )); then
+    echo
+    if (( CANDIDATE_OK )); then
+        ok "DRY RUN: would publish $WORKING_BRANCH @ $(git rev-parse --short "$CANDIDATE_SHA") and check it out."
+    else
+        warn "DRY RUN: no feature survived — would fall back to plain $MAIN_BRANCH."
+    fi
+    (( DEPS_CHANGED )) && warn "DRY RUN: would reinstall dependencies (deps changed)."
+    say "DRY RUN complete. No live changes made. Still on: $START_BRANCH"
+    exit 0
+fi
+
+# Real run: sync main + fork mirror.
+say "Syncing $MAIN_BRANCH and fork mirror..."
+git checkout --quiet "$MAIN_BRANCH"
+git merge --ff-only --quiet "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+git push --quiet "$ORIGIN_REMOTE" "$MAIN_BRANCH"
+ok "main → $(git rev-parse --short HEAD), fork mirror updated."
+
+# Reinstall deps if upstream changed them.
+if (( DEPS_CHANGED )); then
+    say "Reinstalling dependencies (deps changed)..."
+    # venv is uv-managed and has no pip, so use uv (not "python -m pip").
+    if uv pip install -e "$REPO" --python "$VENV_PY" >/dev/null 2>&1; then
+        ok "dependencies reinstalled."
+    else
+        warn "dependency reinstall failed — run 'hermes update' or 'uv pip install -e .' manually."
+    fi
+fi
+
+# Publish working or fall back to main.
+if (( CANDIDATE_OK )); then
+    git branch -f "$WORKING_BRANCH" "$CANDIDATE_SHA"
+    git checkout --quiet "$WORKING_BRANCH"
+    git push --force-with-lease --quiet "$ORIGIN_REMOTE" "$WORKING_BRANCH"
+    ok "Published $WORKING_BRANCH @ $(git rev-parse --short HEAD) (kept: ${KEPT[*]})."
+else
+    # Already on main from the sync step.
+    warn "No feature survived integration — staying on plain $MAIN_BRANCH (official only)."
+fi
+
+echo
+if (( ${#DROPPED[@]} > 0 )); then
+    warn "Dropped features: ${DROPPED[*]}"
+    echo "  To recover one, teach rerere its resolution once:"
+    echo "    hermes-update-local --teach <dropped-branch>"
+    echo "  Resolve the conflict it sets up and commit; the next run auto-applies it."
+fi
+ok "Done. Now on: $(git rev-parse --abbrev-ref HEAD)"
+git --no-pager log --oneline -5
