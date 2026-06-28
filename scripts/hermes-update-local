@@ -253,10 +253,11 @@ run_evaluate() {
       echo; } > "$report"
 
     # intra-fork file-collision matrix (independent of upstream)
-    local tmpd; tmpd="$(mktemp -d -t hermes-eval-files.XXXXXX)"; local f
+    local tmpd; tmpd="$(mktemp -d -t hermes-eval-files.XXXXXX)"; local f feature_base
     for f in "${FEATURE_BRANCHES[@]}"; do
         git show-ref --verify --quiet "refs/heads/$f" || continue
-        git diff --name-only "$MAIN_BRANCH...$f" > "$tmpd/${f//\//-}.files" 2>/dev/null
+        feature_base="$(git merge-base "$f" "$upstream_main")"
+        git diff --name-only "$feature_base..$f" > "$tmpd/${f//\//-}.files" 2>/dev/null
     done
     echo; say "Intra-fork file collisions (same file touched by >1 feature):"
     { echo "## intra-fork file collisions"; echo; } >> "$report"
@@ -282,13 +283,14 @@ run_evaluate() {
         fi
         local filesF nfiles overlap noverlap symF symUp symOverlap probe kw clog
         local has_probe owned reroutes updiff reroute_changed moved cov _cov_n _cov_total bucket bcol rec mergedesc
-        filesF="$(git diff --name-only "$MAIN_BRANCH...$f" 2>/dev/null)"
+        feature_base="$(git merge-base "$f" "$upstream_main")"
+        filesF="$(git diff --name-only "$feature_base..$f" 2>/dev/null)"
         nfiles="$(printf '%s\n' "$filesF" | grep -cve '^$')"
         overlap=""; [[ -n "$filesF" ]] && overlap="$(git diff --name-only "$prev_main" "$upstream_main" -- $filesF 2>/dev/null | sort -u)"
         noverlap="$(printf '%s\n' "$overlap" | grep -cve '^$')"
         symOverlap=""
         if [[ -n "$overlap" ]]; then
-            symF="$(git diff "$MAIN_BRANCH...$f" -- $overlap 2>/dev/null | hunk_contexts)"
+            symF="$(git diff "$feature_base..$f" -- $overlap 2>/dev/null | hunk_contexts)"
             symUp="$(git diff "$prev_main" "$upstream_main" -- $overlap 2>/dev/null | hunk_contexts)"
             [[ -n "$symF" && -n "$symUp" ]] && symOverlap="$(printf '%s\n' "$symF" | grep -Fxf <(printf '%s\n' "$symUp"))"
         fi
@@ -396,10 +398,10 @@ run_evaluate() {
                 printf '%s'   "$(printf '%s' "$overlap" | _join ', ')" > "$jdir/overlap.txt"
                 printf '%s\n' "$clog"                                  > "$jdir/changelog.txt"
                 if [[ -n "$overlap" ]]; then
-                    git diff "$MAIN_BRANCH...$f" -- $overlap           > "$jdir/feature.diff"  2>/dev/null
+                    git diff "$feature_base..$f" -- $overlap          > "$jdir/feature.diff"  2>/dev/null
                     git diff "$prev_main" "$upstream_main" -- $overlap > "$jdir/upstream.diff" 2>/dev/null
                 else
-                    git diff "$MAIN_BRANCH...$f"                       > "$jdir/feature.diff"  2>/dev/null
+                    git diff "$feature_base..$f"                       > "$jdir/feature.diff"  2>/dev/null
                 fi
                 jout="$( cd "$REPO" && PYTHONPATH="$REPO" "$VENV_PY" "$JUDGE_PY" "$jdir" 2>/dev/null )"; jrc=$?
                 if (( jrc == 0 )) && [[ -n "$jout" ]]; then
@@ -528,6 +530,7 @@ smoke_test() {
 # per-feature imports above remain the cheap first-pass check.
 TARGETED_TESTS=(
     tests/agent/test_anthropic_subscription_only.py
+    tests/agent/test_auxiliary_client.py
     tests/agent/test_prompt_builder.py
     tests/gateway/test_runtime_footer.py
     tests/gateway/test_telegram_dispatch_handoff.py

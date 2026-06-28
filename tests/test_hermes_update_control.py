@@ -192,6 +192,26 @@ def test_evaluator_prioritizes_real_conflict_over_hidden_gap(tmp_path: Path) -> 
     assert "[CONFLICT]" in plain
 
 
+def test_evaluator_excludes_upstream_commits_already_in_forward_port(tmp_path: Path) -> None:
+    repo, features = _fixture_repo(tmp_path, conflict=False)
+    _git(repo, "checkout", "-b", "local/forward-port", "upstream/main")
+    _write(repo / "feature_only.py", "CUSTOM = True\n")
+    _git(repo, "add", "feature_only.py")
+    _git(repo, "commit", "-m", "forward port custom feature")
+    _git(repo, "checkout", "main")
+    features.write_text("local/forward-port\n")
+    probes = tmp_path / "probes.conf"
+    probes.write_text("local/forward-port | forward port | |\n")
+    env = _updater_env(repo, features, tmp_path)
+    env["HERMES_PROBES_CONF"] = str(probes)
+
+    result = _run(UPDATER, "--evaluate", cwd=repo, env=env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    details = next(line for line in result.stdout.splitlines() if "files " in line)
+    assert "files 1 | overlap 0" in details
+
+
 def test_probe_manifest_does_not_claim_logging_or_prompt_text_is_replaced() -> None:
     rows = {
         line.split("|", 1)[0].strip(): [part.strip() for part in line.split("|")]
@@ -199,8 +219,8 @@ def test_probe_manifest_does_not_claim_logging_or_prompt_text_is_replaced() -> N
         if line.startswith("local/")
     }
 
-    assert rows["local/aux-async-logging"][3] == ""
-    assert rows["local/proactivity-boundaries"][2] == ""
+    assert rows["local/aux-async-logging-v2"][3] == ""
+    assert rows["local/proactivity-boundaries-v2"][2] == ""
     assert rows["local/update-tooling"][1] == ""
 
 
