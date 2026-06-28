@@ -1821,6 +1821,56 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         return None
 
 
+def load_personal_wiki_tier1() -> Optional[str]:
+    """Load the personal-wiki bootstrap and core tier when present."""
+    wiki_root = Path.home() / ".personal-wiki"
+    sentinel = Path.home() / ".hermes" / ".personal-wiki-was-present"
+    if not wiki_root.exists():
+        if sentinel.exists():
+            logger.warning(
+                "personal-wiki missing at %s but sentinel %s exists; "
+                "tier-1 user context is unavailable",
+                wiki_root,
+                sentinel,
+            )
+        return None
+
+    paths = [wiki_root / "BOOTSTRAP.md"]
+    core_dir = wiki_root / "core"
+    if core_dir.is_dir():
+        paths.extend(sorted(core_dir.glob("*.md")))
+
+    sections: list[str] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            rel = path.relative_to(wiki_root)
+            label = f"personal-wiki/{rel}"
+            sections.append(f"## {label}\n\n{_scan_context_content(content, label)}")
+        except Exception as exc:
+            logger.debug("Could not read %s: %s", path, exc)
+
+    if not sections:
+        return None
+    try:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch(exist_ok=True)
+    except Exception as exc:
+        logger.debug("Could not touch personal-wiki sentinel %s: %s", sentinel, exc)
+
+    content = (
+        "# Personal Wiki (tier-1, always-load)\n\n"
+        "Canonical user identity, preferences, and behavior rules. Treat this "
+        "as authoritative over memory entries when they conflict.\n\n"
+        + "\n\n".join(sections)
+    )
+    return _truncate_content(content, "personal-wiki tier-1", read_path=str(wiki_root))
+
+
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
