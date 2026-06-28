@@ -6,6 +6,7 @@ import logging
 import sys
 
 import pytest
+import agent.prompt_builder as prompt_builder
 
 from agent.prompt_builder import (
     _scan_context_content,
@@ -34,6 +35,22 @@ from agent.prompt_builder import (
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
+
+
+def test_personal_wiki_tier1_loads_bootstrap_and_core(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    wiki = tmp_path / ".personal-wiki"
+    (wiki / "core").mkdir(parents=True)
+    (wiki / "BOOTSTRAP.md").write_text("bootstrap rules\n")
+    (wiki / "core" / "identity.md").write_text("identity rules\n")
+
+    result = prompt_builder.load_personal_wiki_tier1()
+
+    assert "personal-wiki/BOOTSTRAP.md" in result
+    assert "bootstrap rules" in result
+    assert "personal-wiki/core/identity.md" in result
+    assert "identity rules" in result
+    assert (tmp_path / ".hermes" / ".personal-wiki-was-present").exists()
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
@@ -1607,5 +1624,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 
