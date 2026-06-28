@@ -633,6 +633,9 @@ def init_agent(
     # access for Codex Responses API streaming.
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
+    agent._anthropic_auth_mode = "default"
+    agent._anthropic_auth_source = ""
+    agent._anthropic_auth_ignored_sources = ()
 
     # Resolve per-provider / per-model request timeout once up front so
     # every client construction path below (Anthropic native, OpenAI-wire,
@@ -641,7 +644,12 @@ def init_agent(
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
 
     if agent.api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import (
+            build_anthropic_client,
+            get_configured_anthropic_auth_mode,
+            resolve_anthropic_credentials,
+            _is_third_party_anthropic_endpoint,
+        )
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).
         _is_bedrock_anthropic = agent.provider == "bedrock"
@@ -663,8 +671,20 @@ def init_agent(
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
             # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
-            _is_native_anthropic = agent.provider == "anthropic"
-            effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
+            _is_native_anthropic = (
+                agent.provider == "anthropic"
+                and not _is_third_party_anthropic_endpoint(base_url)
+            )
+            _anthropic_creds = None
+            if _is_native_anthropic:
+                _auth_mode = get_configured_anthropic_auth_mode()
+                _anthropic_creds = resolve_anthropic_credentials(
+                    auth_mode=_auth_mode,
+                    explicit_api_key=api_key,
+                )
+                effective_key = _anthropic_creds.token or ""
+            else:
+                effective_key = api_key or ""
 
             # MiniMax OAuth issues short-lived (~15-min) access tokens. The
             # Anthropic SDK caches ``api_key`` as a static string at client
@@ -693,6 +713,16 @@ def init_agent(
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = base_url
+            if _anthropic_creds is not None:
+                agent._anthropic_auth_mode = _anthropic_creds.auth_mode
+                agent._anthropic_auth_source = _anthropic_creds.source
+                agent._anthropic_auth_ignored_sources = tuple(_anthropic_creds.ignored_sources)
+                logger.info(
+                    "Anthropic auth selected: mode=%s source=%s ignored=%s",
+                    agent._anthropic_auth_mode,
+                    agent._anthropic_auth_source,
+                    ",".join(agent._anthropic_auth_ignored_sources) or "-",
+                )
             # Only mark the session as OAuth-authenticated when the token
             # genuinely belongs to native Anthropic.  Third-party providers
             # (MiniMax, Kimi, GLM, LiteLLM proxies) that accept the
@@ -717,6 +747,8 @@ def init_agent(
 
                 if is_token_provider(effective_key):
                     print("🔑 Using credentials: Microsoft Entra ID")
+                elif _anthropic_creds is not None and _anthropic_creds.auth_mode == "subscription_only":
+                    print("🔑 Using credentials: Claude Code OAuth (subscription_only)")
                 elif isinstance(effective_key, str) and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
     elif agent.provider == "moa":
@@ -1875,6 +1907,9 @@ def init_agent(
             "anthropic_api_key": agent._anthropic_api_key,
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
+            "anthropic_auth_mode": getattr(agent, "_anthropic_auth_mode", "default"),
+            "anthropic_auth_source": getattr(agent, "_anthropic_auth_source", ""),
+            "anthropic_auth_ignored_sources": tuple(getattr(agent, "_anthropic_auth_ignored_sources", ()) or ()),
         })
 
 

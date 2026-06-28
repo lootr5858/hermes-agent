@@ -1460,6 +1460,42 @@ def resolve_runtime_provider(
         explicit_base_url=explicit_base_url,
     )
     model_cfg = _get_model_config()
+
+    if provider == "anthropic":
+        try:
+            from agent.anthropic_adapter import (
+                ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+                AnthropicAuthError,
+                get_configured_anthropic_auth_mode,
+                resolve_anthropic_credentials,
+            )
+            anthropic_auth_mode = get_configured_anthropic_auth_mode(model_cfg=model_cfg)
+        except Exception:
+            anthropic_auth_mode = "default"
+
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower() if isinstance(model_cfg, dict) else ""
+        cfg_base_url = ""
+        if cfg_provider == "anthropic" and isinstance(model_cfg, dict):
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        target_base_url = (explicit_base_url or cfg_base_url or "https://api.anthropic.com").strip().rstrip("/")
+        is_direct_anthropic = not target_base_url or "anthropic.com" in target_base_url.lower()
+        if anthropic_auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY and is_direct_anthropic:
+            try:
+                creds = resolve_anthropic_credentials(auth_mode=anthropic_auth_mode)
+            except AnthropicAuthError as exc:
+                raise AuthError(str(exc)) from exc
+            return {
+                "provider": "anthropic",
+                "api_mode": "anthropic_messages",
+                "base_url": target_base_url or "https://api.anthropic.com",
+                "api_key": creds.token,
+                "auth_mode": creds.auth_mode,
+                "auth_source": creds.source,
+                "ignored_auth_sources": list(creds.ignored_sources),
+                "source": creds.source,
+                "requested_provider": requested_provider,
+            }
+
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,
         requested_provider=requested_provider,
@@ -1702,19 +1738,39 @@ def resolve_runtime_provider(
                     "config.yaml model section at a custom env var."
                 )
         else:
-            from agent.anthropic_adapter import resolve_anthropic_token
-            token = resolve_anthropic_token()
+            from agent.anthropic_adapter import (
+                ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+                AnthropicAuthError,
+                get_configured_anthropic_auth_mode,
+                resolve_anthropic_credentials,
+                resolve_anthropic_token,
+            )
+            auth_mode = get_configured_anthropic_auth_mode(model_cfg=model_cfg)
+            if auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+                try:
+                    creds = resolve_anthropic_credentials(auth_mode=auth_mode)
+                except AnthropicAuthError as exc:
+                    raise AuthError(str(exc)) from exc
+                token = creds.token
+                source = creds.source
+            else:
+                token = resolve_anthropic_token()
+                source = "env"
             if not token:
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."
                 )
+        if _is_azure_endpoint:
+            source = "azure-env"
         return {
             "provider": "anthropic",
             "api_mode": "anthropic_messages",
             "base_url": base_url,
             "api_key": token,
-            "source": "env",
+            "auth_mode": auth_mode if not _is_azure_endpoint else "api_key",
+            "auth_source": source,
+            "source": source,
             "requested_provider": requested_provider,
         }
 
