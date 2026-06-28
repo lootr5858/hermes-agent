@@ -4003,12 +4003,19 @@ class AIAgent:
             return False
 
         try:
-            from agent.anthropic_adapter import resolve_anthropic_credentials, build_anthropic_client
-
-            creds = resolve_anthropic_credentials(
-                auth_mode=getattr(self, "_anthropic_auth_mode", None)
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_credentials,
+                resolve_anthropic_token,
             )
-            new_token = creds.token
+
+            auth_mode = getattr(self, "_anthropic_auth_mode", None) or "default"
+            creds = None
+            if auth_mode == "subscription_only":
+                creds = resolve_anthropic_credentials(auth_mode=auth_mode)
+                new_token = creds.token
+            else:
+                new_token = resolve_anthropic_token()
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
@@ -4035,9 +4042,10 @@ class AIAgent:
             return False
 
         self._anthropic_api_key = new_token
-        self._anthropic_auth_mode = getattr(creds, "auth_mode", getattr(self, "_anthropic_auth_mode", "default"))
-        self._anthropic_auth_source = getattr(creds, "source", getattr(self, "_anthropic_auth_source", ""))
-        self._anthropic_auth_ignored_sources = tuple(getattr(creds, "ignored_sources", ()) or ())
+        if creds is not None:
+            self._anthropic_auth_mode = creds.auth_mode
+            self._anthropic_auth_source = creds.source
+            self._anthropic_auth_ignored_sources = tuple(creds.ignored_sources or ())
         # Update OAuth flag — token type may have changed (API key ↔ OAuth).
         # Only treat as OAuth on native Anthropic; third-party endpoints using
         # the Anthropic protocol must not trip OAuth paths (#1739 & third-party

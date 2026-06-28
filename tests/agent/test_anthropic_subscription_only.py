@@ -108,6 +108,26 @@ def test_runtime_provider_subscription_only_bypasses_anthropic_pool(monkeypatch)
     assert resolved["ignored_auth_sources"] == ["ANTHROPIC_API_KEY"]
 
 
+def test_subscription_only_rejects_non_anthropic_endpoint(monkeypatch):
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {
+        "provider": "anthropic",
+        "auth_mode": "subscription_only",
+    })
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "_resolve_named_custom_runtime", lambda **k: None)
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: pytest.fail("strict mode must not inspect the credential pool"),
+    )
+
+    with pytest.raises(rp.AuthError, match="subscription_only.*api.anthropic.com"):
+        rp.resolve_runtime_provider(
+            requested="anthropic",
+            explicit_base_url="https://anthropic.example.net/v1",
+        )
+
+
 def test_oauth_kwargs_include_claude_code_billing_marker(monkeypatch):
     monkeypatch.setattr(aa, "_get_claude_code_version", lambda: "2.1.168")
 

@@ -1478,8 +1478,14 @@ def resolve_runtime_provider(
         if cfg_provider == "anthropic" and isinstance(model_cfg, dict):
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
         target_base_url = (explicit_base_url or cfg_base_url or "https://api.anthropic.com").strip().rstrip("/")
-        is_direct_anthropic = not target_base_url or "anthropic.com" in target_base_url.lower()
-        if anthropic_auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY and is_direct_anthropic:
+        is_direct_anthropic = base_url_host_matches(target_base_url, "api.anthropic.com")
+        if anthropic_auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+            if not is_direct_anthropic:
+                raise AuthError(
+                    "Anthropic subscription_only mode only supports the native "
+                    "https://api.anthropic.com endpoint; refusing to send Claude "
+                    "subscription credentials to another host."
+                )
             try:
                 creds = resolve_anthropic_credentials(auth_mode=anthropic_auth_mode)
             except AnthropicAuthError as exc:
