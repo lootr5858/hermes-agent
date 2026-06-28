@@ -395,6 +395,8 @@ def _detect_claude_code_version() -> str:
 
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+_CLAUDE_CODE_BILLING_ENTRYPOINT = "sdk-cli"
+_CLAUDE_CODE_BILLING_CACHE_HINT = "cch=00000"
 _MCP_TOOL_PREFIX = "mcp__"
 
 
@@ -404,6 +406,22 @@ def _get_claude_code_version() -> str:
     if _claude_code_version_cache is None:
         _claude_code_version_cache = _detect_claude_code_version()
     return _claude_code_version_cache
+
+
+def _claude_code_billing_marker() -> str:
+    """Return Claude Code's subscription billing attribution marker.
+
+    Claude Code injects this marker as a non-cacheable system block before the
+    ordinary system prompt. Anthropic uses it when routing Claude subscription
+    OAuth traffic; without it, direct Messages API OAuth requests can be treated
+    as third-party extra-usage traffic even with valid Claude Code credentials.
+    """
+    return (
+        "x-anthropic-billing-header: "
+        f"cc_version={_get_claude_code_version()}; "
+        f"cc_entrypoint={_CLAUDE_CODE_BILLING_ENTRYPOINT}; "
+        f"{_CLAUDE_CODE_BILLING_CACHE_HINT};"
+    )
 
 
 def _is_oauth_token(key: str) -> bool:
@@ -2657,14 +2675,15 @@ def build_anthropic_kwargs(
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
-        # 1. Prepend Claude Code system prompt identity
+        # 1. Prepend Claude Code subscription attribution and system identity.
+        billing_block = {"type": "text", "text": _claude_code_billing_marker()}
         cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
         if isinstance(system, list):
-            system = [cc_block] + system
+            system = [billing_block, cc_block] + system
         elif isinstance(system, str) and system:
-            system = [cc_block, {"type": "text", "text": system}]
+            system = [billing_block, cc_block, {"type": "text", "text": system}]
         else:
-            system = [cc_block]
+            system = [billing_block, cc_block]
 
         # 2. Sanitize system prompt — replace product name references
         #    to avoid Anthropic's server-side content filters.
