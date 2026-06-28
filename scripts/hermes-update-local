@@ -10,9 +10,10 @@
 #      feature branch one at a time. git rerere auto-resolves known conflicts.
 #   3. Drop ONLY features that conflict (rerere can't resolve) or fail validation;
 #      keep every feature that merges cleanly and still imports.
-#   4. Validate via a Python import smoke test (catches the "textually clean but
-#      broken" merge that a plain git merge would miss).
-#   5. Publish atomically, or fall back to plain main. Always end runnable.
+#   4. Validate imports after each merge, then run targeted behavior tests once
+#      against the assembled candidate.
+#   5. Publish atomically. Required-feature loss or failed behavior tests aborts
+#      instead of replacing the custom stack with plain main.
 #
 # Usage:
 #   hermes-update-local                    # perform the update
@@ -26,6 +27,10 @@
 # branches here — they are stable sources; only `working` is regenerated.
 
 set -euo pipefail
+
+# Exit status contract used by the unattended update gate.
+# 0 = safe/success, 10 = valid result requiring human review, 1 = operational error.
+EXIT_REVIEW=10
 
 # ── Config ───────────────────────────────────────────────────────────────────
 REPO="${HERMES_REPO:-$HOME/.hermes/hermes-agent}"
@@ -308,15 +313,15 @@ run_evaluate() {
         clog=""; [[ -n "$kw" ]] && clog="$(printf '%s\n' "$changelog" | grep -iE "$kw" 2>/dev/null | head -8)"
 
         if (( has_probe )); then
-            if (( _cov_total > 0 && _cov_n == _cov_total )); then
+            if [[ "$probe" == conflict ]]; then
+                bucket="CONFLICT"; bcol="$c_yellow"
+                rec="merge has no recorded resolution${moved:+ (upstream MOVED ${moved%% } → re-anchor)}. Forward-port or teach it."
+            elif (( _cov_total > 0 && _cov_n == _cov_total )); then
                 bucket="FULLY_COVERED"; bcol="$c_green"
                 rec="upstream now defines ALL the feature's distinctive symbols → RETIRE candidate (confirm, then drop from the features conf — never auto-retired)."
             elif [[ -n "$reroute_changed" ]]; then
                 bucket="GAP_HIDDEN"; bcol="$c_red"
                 rec="upstream changed symbol(s) you reroute (${reroute_changed%% }) — a clean merge can HIDE that change. Forward-port it, or slim the feature."
-            elif [[ "$probe" == conflict ]]; then
-                bucket="CONFLICT"; bcol="$c_yellow"
-                rec="merge has no recorded resolution${moved:+ (upstream MOVED ${moved%% } → re-anchor)}. Run --teach <branch> to record it."
             elif [[ -n "$overlap" || -n "$clog" || "${_cov_n:-0}" -gt 0 ]]; then
                 # COMPLEMENTARY: feature & upstream share a signal. Split by symbol-overlap so
                 # the bucket name implies the action (no secondary field lookup needed):
@@ -443,6 +448,30 @@ if [[ -n "$TEACH_BRANCH" ]]; then
     TWT="$(mktemp -u -t hermes-teach-"$san".XXXXXX)"
     git branch -D "_teach_$san" >/dev/null 2>&1 || true
     git worktree add --quiet -b "_teach_$san" "$TWT" "$UPSTREAM_REMOTE/$MAIN_BRANCH"
+
+    # Reproduce the configured stack up to the target. Teaching directly on
+    # upstream/main can record the wrong resolution when earlier features touch
+    # the same files.
+    load_features
+    target_configured=0
+    for predecessor in "${FEATURE_BRANCHES[@]}"; do
+        if [[ "$predecessor" == "$TEACH_BRANCH" ]]; then
+            target_configured=1
+            break
+        fi
+        git show-ref --verify --quiet "refs/heads/$predecessor" || { err "configured predecessor '$predecessor' not found"; exit 1; }
+        if git -C "$TWT" merge --no-edit "$predecessor" >/dev/null 2>&1; then
+            continue
+        elif [[ -z "$(git -C "$TWT" ls-files -u)" ]] && git -C "$TWT" commit --no-edit >/dev/null 2>&1; then
+            continue
+        fi
+        git -C "$TWT" merge --abort >/dev/null 2>&1 || true
+        err "configured predecessor '$predecessor' conflicts before $TEACH_BRANCH"
+        err "Resolve/forward-port that predecessor first; target teaching was not started."
+        exit "$EXIT_REVIEW"
+    done
+    (( target_configured )) || warn "$TEACH_BRANCH is not in $FEATURES_CONF; teaching directly on upstream/main."
+
     if git -C "$TWT" merge --no-edit "$TEACH_BRANCH" >/dev/null 2>&1; then
         ok "$TEACH_BRANCH merges cleanly onto $UPSTREAM_REMOTE/$MAIN_BRANCH — nothing to teach."
         git worktree remove --force "$TWT" >/dev/null 2>&1 || true
@@ -493,6 +522,27 @@ fi
 smoke_test() {
     local dir="$1"
     ( cd "$dir" && PYTHONPATH="$dir" "$VENV_PY" -c "import run_agent" ) >/dev/null 2>&1
+}
+
+# Small behavior suite for custom features. Run once on the assembled candidate;
+# per-feature imports above remain the cheap first-pass check.
+TARGETED_TESTS=(
+    tests/agent/test_anthropic_subscription_only.py
+    tests/agent/test_prompt_builder.py
+    tests/gateway/test_runtime_footer.py
+    tests/gateway/test_telegram_dispatch_handoff.py
+)
+validate_candidate() {
+    local dir="$1" test_path
+    local -a present=()
+    smoke_test "$dir" || return 1
+    [[ -x "$dir/scripts/run_tests.sh" ]] || return 0
+    for test_path in "${TARGETED_TESTS[@]}"; do
+        [[ -f "$dir/$test_path" ]] && present+=("$test_path")
+    done
+    (( ${#present[@]} == 0 )) && return 0
+    TARGETED_TESTS_RUN="${present[*]}"
+    ( cd "$dir" && scripts/run_tests.sh "${present[@]}" ) >/dev/null 2>&1
 }
 
 # ── 0. Pre-flight ────────────────────────────────────────────────────────────
@@ -588,8 +638,14 @@ done
 
 # Final guard: candidate must import even with all kept features.
 CANDIDATE_OK=0
-if (( ${#KEPT[@]} > 0 )) && smoke_test "$WT"; then
-    CANDIDATE_OK=1
+VALIDATION_FAILED=0
+TARGETED_TESTS_RUN=""
+if (( ${#KEPT[@]} > 0 )); then
+    if validate_candidate "$WT"; then
+        CANDIDATE_OK=1
+    else
+        VALIDATION_FAILED=1
+    fi
 fi
 CANDIDATE_SHA="$(git -C "$WT" rev-parse HEAD)"
 
@@ -620,7 +676,20 @@ if (( ${#REQUIRED_DROPPED[@]} > 0 )); then
         err "Refusing to publish a degraded $WORKING_BRANCH. Live checkout left untouched on $START_BRANCH."
         err "Teach the resolution, then re-run:  hermes-update-local --teach ${REQUIRED_DROPPED[0]}"
     fi
-    exit 1
+    exit "$EXIT_REVIEW"
+fi
+
+# Never replace a custom stack with plain main because its assembled behavior
+# tests failed. That is a review result, not a valid fallback candidate.
+if (( VALIDATION_FAILED )); then
+    echo
+    err "Candidate targeted validation failed${TARGETED_TESTS_RUN:+: $TARGETED_TESTS_RUN}"
+    if (( DRY_RUN )); then
+        warn "DRY RUN: would ABORT publish and keep current $WORKING_BRANCH unchanged."
+    else
+        err "Refusing to publish or fall back to plain $MAIN_BRANCH. Live checkout left untouched."
+    fi
+    exit "$EXIT_REVIEW"
 fi
 
 if (( DRY_RUN )); then
