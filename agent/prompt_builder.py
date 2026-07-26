@@ -1918,6 +1918,119 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         return None
 
 
+def load_user_context_tier1() -> Optional[str]:
+    """Load the configured brain bootstrap as tier-one user context."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception as exc:
+        logger.warning(
+            "Could not read context.brain_root from Hermes config; "
+            "tier-one user context was not loaded: %s",
+            exc,
+        )
+        return None
+
+    context_config = config.get("context")
+    brain_root = (
+        context_config.get("brain_root")
+        if isinstance(context_config, dict)
+        else None
+    )
+    if brain_root is None or (
+        isinstance(brain_root, str) and not brain_root.strip()
+    ):
+        logger.warning(
+            "context.brain_root is required for tier-one user context; "
+            "nothing was loaded"
+        )
+        return None
+    if not isinstance(brain_root, str):
+        logger.warning(
+            "context.brain_root must be a string, got %s; nothing was loaded",
+            type(brain_root).__name__,
+        )
+        return None
+
+    root = Path(brain_root.strip())
+    if not root.is_absolute():
+        logger.warning(
+            "context.brain_root must be an absolute path, got %s; "
+            "nothing was loaded",
+            root,
+        )
+        return None
+    if not root.is_dir():
+        logger.warning(
+            "Configured context.brain_root does not exist or is not a "
+            "directory: %s; nothing was loaded",
+            root,
+        )
+        return None
+
+    bootstrap = root / "BOOTSTRAP.md"
+    if not bootstrap.is_file():
+        logger.warning(
+            "Configured brain bootstrap is missing: %s; nothing was loaded",
+            bootstrap,
+        )
+        return None
+
+    resolved_root = root.resolve()
+    resolved_bootstrap = bootstrap.resolve()
+    try:
+        resolved_bootstrap.relative_to(resolved_root)
+    except ValueError:
+        logger.warning(
+            "Configured brain bootstrap resolves outside configured "
+            "context.brain_root: %s; nothing was loaded",
+            resolved_bootstrap,
+        )
+        return None
+
+    try:
+        bootstrap_content = resolved_bootstrap.read_text(
+            encoding="utf-8"
+        ).strip()
+    except Exception as exc:
+        logger.warning(
+            "Could not read configured brain bootstrap %s; nothing was "
+            "loaded: %s",
+            resolved_bootstrap,
+            exc,
+        )
+        return None
+    if not bootstrap_content:
+        logger.warning(
+            "Configured brain bootstrap is empty: %s; nothing was loaded",
+            resolved_bootstrap,
+        )
+        return None
+
+    label = "brain/BOOTSTRAP.md"
+    scanned = _scan_context_content(bootstrap_content, label)
+    sentinel = get_hermes_home() / ".brain-bootstrap-was-present"
+    try:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch(exist_ok=True)
+    except Exception as exc:
+        logger.debug("Could not touch brain-bootstrap sentinel %s: %s", sentinel, exc)
+
+    content = (
+        "# Routed Brain Bootstrap (tier-1, always-load)\n\n"
+        "The configured brain bootstrap is the routing authority for user "
+        "context. Follow its routing instructions rather than loading brain "
+        "files implicitly.\n\n"
+        f"## {label}\n\n{scanned}"
+    )
+    return _truncate_content(
+        content,
+        "brain bootstrap tier-1",
+        read_path=str(bootstrap),
+    )
+
+
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
