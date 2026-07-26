@@ -1,6 +1,7 @@
 import type * as React from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
+import { RowButton } from '@/components/ui/row-button'
 import { cn } from '@/lib/utils'
 
 // Shared, content-agnostic sidebar chrome — used by both the flat session
@@ -42,6 +43,22 @@ export function SidebarRowNest({ className, ...props }: React.ComponentProps<'di
   return <SidebarRowStack className={cn('pb-1 pl-4', className)} {...props} />
 }
 
+/**
+ * Chronological date-bucket separator ("Yesterday" / "Last week" / "June") for
+ * the session list. One flat row — a small caption plus a hairline rule — so it
+ * groups sessions by recency without adding a level of indentation.
+ */
+export function SidebarDateDivider({ className, label, ...props }: React.ComponentProps<'div'> & { label: string }) {
+  return (
+    <div className={cn('flex select-none items-center gap-2 px-2 pb-0.5 pt-2', className)} {...props}>
+      <span className="shrink-0 text-[0.64rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-quaternary)">
+        {label}
+      </span>
+      <span aria-hidden="true" className="h-px flex-1 bg-(--ui-stroke-tertiary)" />
+    </div>
+  )
+}
+
 /** Outer grid — sole owner of row height. */
 export function SidebarRowShell({
   actions,
@@ -64,7 +81,7 @@ export function SidebarRowCluster({ className, ...props }: React.ComponentProps<
 
 /** Session row main tap target. */
 export function SidebarRowBody({ className, ...props }: React.ComponentProps<'button'>) {
-  return <button className={cn(rowInset, 'bg-transparent text-left', className)} type="button" {...props} />
+  return <RowButton className={cn(rowInset, 'bg-transparent text-left', className)} {...props} />
 }
 
 /** Tappable label — underline/truncate live on the inner span, not the button. */
@@ -75,9 +92,9 @@ export function SidebarRowLink({
   ...props
 }: React.ComponentProps<'button'> & { labelClassName?: string }) {
   return (
-    <button className={cn('min-w-0 shrink bg-transparent p-0 text-left', className)} type="button" {...props}>
+    <RowButton className={cn('min-w-0 shrink bg-transparent p-0 text-left', className)} {...props}>
       <span className={cn(rowLabel, labelClassName)}>{children}</span>
-    </button>
+    </RowButton>
   )
 }
 
