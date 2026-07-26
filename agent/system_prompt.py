@@ -200,9 +200,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     memory_manager = getattr(agent, "_memory_manager", None)
     if not (memory_manager and getattr(memory_manager, "providers", None)):
         try:
-            personal_wiki = _r.load_personal_wiki_tier1()
-            if personal_wiki:
-                stable_parts.append(personal_wiki)
+            tier_one_context = _r.load_user_context_tier1()
+            if tier_one_context:
+                stable_parts.append(tier_one_context)
         except Exception:
             pass
 

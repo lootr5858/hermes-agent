@@ -2341,6 +2341,9 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Optional absolute root whose BOOTSTRAP.md is loaded as routed
+        # tier-one user context by Evan's local prompt feature.
+        "brain_root": "",
     },
 
     # Persistent memory -- bounded curated memory injected into system prompt

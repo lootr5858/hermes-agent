@@ -80,6 +80,21 @@ class TestUserContextTier1:
         assert "OBSOLETE MARKER" not in caplog.text
         assert "context.brain_root is required" in caplog.text
 
+    def test_missing_brain_root_setting_injects_nothing(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"context": {}},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = prompt_builder.load_user_context_tier1()
+
+        assert result is None
+        assert "context.brain_root is required" in caplog.text
+
     def test_missing_brain_root_injects_nothing(
         self, monkeypatch, tmp_path, caplog
     ):
@@ -144,6 +159,28 @@ class TestUserContextTier1:
 
         assert "[BLOCKED:" in result
         assert hostile not in result
+
+    def test_bootstrap_symlink_cannot_escape_brain_root(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        outside = tmp_path / "outside.md"
+        outside.write_text("OUTSIDE MARKER\n")
+        brain = tmp_path / "brain"
+        brain.mkdir()
+        (brain / "BOOTSTRAP.md").symlink_to(outside)
+        self._configure(monkeypatch, str(brain))
+
+        with caplog.at_level(logging.WARNING):
+            result = prompt_builder.load_user_context_tier1()
+
+        assert result is None
+        assert "outside configured context.brain_root" in caplog.text
+
+    def test_brain_root_is_accepted_by_config_key_validation(self):
+        from hermes_cli.config import _validate_config_key
+
+        assert _validate_config_key("context.brain_root") == (True, None)
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
 
