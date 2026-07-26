@@ -57,30 +57,30 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
-class TestPersonalWikiFallback:
+class TestUserContextTier1SystemPrompt:
     def test_injected_without_active_memory_provider(self):
         agent = _make_agent(_memory_manager=None)
         with patch(
-            "run_agent.load_personal_wiki_tier1",
-            return_value="PERSONAL WIKI TIER ONE",
+            "run_agent.load_user_context_tier1",
+            return_value="TIER ONE BRAIN BOOTSTRAP",
             create=True,
-        ) as load_wiki:
+        ) as load_tier_one:
             stable = _stable_prompt(agent)
 
-        assert "PERSONAL WIKI TIER ONE" in stable
-        load_wiki.assert_called_once_with()
+        assert "TIER ONE BRAIN BOOTSTRAP" in stable
+        load_tier_one.assert_called_once_with()
 
     def test_not_duplicated_with_active_memory_provider(self):
         agent = _make_agent(_memory_manager=SimpleNamespace(providers=[object()]))
         with patch(
-            "run_agent.load_personal_wiki_tier1",
-            return_value="PERSONAL WIKI TIER ONE",
+            "run_agent.load_user_context_tier1",
+            return_value="TIER ONE BRAIN BOOTSTRAP",
             create=True,
-        ) as load_wiki:
+        ) as load_tier_one:
             stable = _stable_prompt(agent)
 
-        assert "PERSONAL WIKI TIER ONE" not in stable
-        load_wiki.assert_not_called()
+        assert "TIER ONE BRAIN BOOTSTRAP" not in stable
+        load_tier_one.assert_not_called()
 
 
 def _stable_prompt(agent):
