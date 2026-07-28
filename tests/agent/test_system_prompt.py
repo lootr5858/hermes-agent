@@ -5,7 +5,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from agent.prompt_builder import drain_truncation_warnings
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+
+
+@pytest.fixture(autouse=True)
+def _reset_truncation_warnings():
+    """Prevent warning-queue state from leaking across prompt test modules."""
+    drain_truncation_warnings()
+    yield
+    drain_truncation_warnings()
 
 
 def _make_agent(**overrides):
