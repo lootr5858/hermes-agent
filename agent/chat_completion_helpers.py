@@ -1985,6 +1985,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
+    fb_auth_mode = ""
+    if fb_provider == "anthropic":
+        from agent.anthropic_adapter import get_configured_anthropic_auth_mode
+
+        fb_auth_mode = get_configured_anthropic_auth_mode()
+    strict_subscription = fb_auth_mode == "subscription_only"
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2119,6 +2125,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        agent.auth_mode = fb_auth_mode
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -2144,7 +2151,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 )
                 agent._credential_pool = None
                 agent._credential_pool_entry_id = None
-        if getattr(agent, "_credential_pool", None) is None:
+        if strict_subscription:
+            agent._credential_pool = None
+            agent._credential_pool_entry_id = None
+        elif getattr(agent, "_credential_pool", None) is None:
             try:
                 from agent.credential_pool import load_pool
 
@@ -2168,8 +2178,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
-            from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-            effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_credentials,
+                resolve_anthropic_token,
+                _is_oauth_token,
+            )
+            anthropic_creds = None
+            if fb_provider == "anthropic" and strict_subscription:
+                anthropic_creds = resolve_anthropic_credentials(
+                    auth_mode=fb_auth_mode,
+                    explicit_api_key=fb_client.api_key,
+                )
+                effective_key = anthropic_creds.token or ""
+            else:
+                effective_key = (
+                    fb_client.api_key or resolve_anthropic_token() or ""
+                ) if fb_provider == "anthropic" else (fb_client.api_key or "")
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = fb_base_url
@@ -2177,6 +2202,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 effective_key, agent._anthropic_base_url, timeout=_fb_timeout,
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
+            if anthropic_creds is not None:
+                agent.auth_mode = anthropic_creds.auth_mode
+                agent._anthropic_auth_mode = anthropic_creds.auth_mode
+                agent._anthropic_auth_source = anthropic_creds.source
+                agent._anthropic_auth_ignored_sources = tuple(
+                    anthropic_creds.ignored_sources
+                )
             agent.client = None
             agent._client_kwargs = {}
         else:

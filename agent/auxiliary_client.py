@@ -3599,26 +3599,41 @@ def _try_azure_foundry(
 
 def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import (
+            ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+            build_anthropic_client,
+            get_configured_anthropic_auth_mode,
+            resolve_anthropic_credentials,
+            resolve_anthropic_token,
+        )
     except ImportError:
         return None, None
 
-    pool_present, entry = _select_pool_entry("anthropic")
-    if pool_present and entry is not None:
-        token = explicit_api_key or _pool_runtime_api_key(entry)
+    auth_mode = get_configured_anthropic_auth_mode()
+    if auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+        creds = resolve_anthropic_credentials(
+            auth_mode=auth_mode,
+            explicit_api_key=explicit_api_key,
+        )
+        token = creds.token
+        pool_present, entry = False, None
     else:
-        # Pool absent, OR pool present but no usable entry (expired token +
-        # stale refresh_token, all entries exhausted, etc). Fall through to the
-        # legacy resolver instead of hard-failing: a temporarily dead pool
-        # entry must not wedge auxiliary tasks when a valid standalone
-        # credential (ANTHROPIC_TOKEN, credentials file, API key) exists. This
-        # matches the openrouter and codex paths, which already fall back to
-        # their env/auth-store credential on (True, None). Without this, the
-        # goal judge and every other Anthropic-routed side channel died with
-        # "no auxiliary client configured" while the main session stayed
-        # healthy (it resolves the env token directly).
-        entry = None
-        token = explicit_api_key or resolve_anthropic_token()
+        pool_present, entry = _select_pool_entry("anthropic")
+        if pool_present and entry is not None:
+            token = explicit_api_key or _pool_runtime_api_key(entry)
+        else:
+            # Pool absent, OR pool present but no usable entry (expired token +
+            # stale refresh_token, all entries exhausted, etc). Fall through to the
+            # legacy resolver instead of hard-failing: a temporarily dead pool
+            # entry must not wedge auxiliary tasks when a valid standalone
+            # credential (ANTHROPIC_TOKEN, credentials file, API key) exists. This
+            # matches the openrouter and codex paths, which already fall back to
+            # their env/auth-store credential on (True, None). Without this, the
+            # goal judge and every other Anthropic-routed side channel died with
+            # "no auxiliary client configured" while the main session stayed
+            # healthy (it resolves the env token directly).
+            entry = None
+            token = explicit_api_key or resolve_anthropic_token()
     if not token:
         return None, None
 
@@ -3637,7 +3652,10 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         from hermes_cli.config import load_config_readonly
         cfg = load_config_readonly()
         model_cfg = cfg.get("model")
-        if isinstance(model_cfg, dict):
+        if (
+            auth_mode != ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY
+            and isinstance(model_cfg, dict)
+        ):
             cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == "anthropic":
                 cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")

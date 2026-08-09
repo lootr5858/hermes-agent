@@ -949,6 +949,16 @@ def recover_with_credential_pool(
     if pool is None:
         return False, has_retried_429
 
+    if (
+        (getattr(agent, "provider", "") or "").strip().lower() == "anthropic"
+        and (
+            getattr(agent, "_anthropic_auth_mode", "")
+            or getattr(agent, "auth_mode", "")
+        )
+        == "subscription_only"
+    ):
+        return False, has_retried_429
+
     # Defensive guard: if a fallback provider is active and its provider name
     # doesn't match the pool's provider, the pool belongs to the PRIMARY
     # provider.  Mutating it based on fallback errors would corrupt the
@@ -1481,6 +1491,15 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
+    rt = agent._primary_runtime
+    strict_subscription = (
+        str(rt.get("provider") or "").strip().lower() == "anthropic"
+        and str(
+            rt.get("anthropic_auth_mode") or rt.get("auth_mode") or ""
+        ).strip().lower()
+        == "subscription_only"
+    )
+
     # ── Reset-aware gate ──
     # The 60s ``_rate_limited_until`` cooldown covers transient rate limits,
     # but subscription-style providers (Claude Pro/Max 5-hour windows, ChatGPT
@@ -1504,22 +1523,22 @@ def restore_primary_runtime(agent) -> bool:
     # happens at most once per restore.
     prefetched_primary_pool = None
     try:
-        primary_provider = str(
-            (agent._primary_runtime or {}).get("provider") or ""
-        ).strip().lower()
-        pool = getattr(agent, "_credential_pool", None)
-        if not credential_pool_matches_provider(
-            pool,
-            primary_provider,
-            base_url=str((agent._primary_runtime or {}).get("base_url") or ""),
-        ):
-            from agent.credential_pool import load_pool
+        next_at = None
+        if not strict_subscription:
+            primary_provider = str(rt.get("provider") or "").strip().lower()
+            pool = getattr(agent, "_credential_pool", None)
+            if not credential_pool_matches_provider(
+                pool,
+                primary_provider,
+                base_url=str(rt.get("base_url") or ""),
+            ):
+                from agent.credential_pool import load_pool
 
-            prefetched_primary_pool = (
-                load_pool(primary_provider) if primary_provider else None
-            )
-            pool = prefetched_primary_pool
-        next_at = getattr(pool, "next_available_at", lambda: None)()
+                prefetched_primary_pool = (
+                    load_pool(primary_provider) if primary_provider else None
+                )
+                pool = prefetched_primary_pool
+            next_at = getattr(pool, "next_available_at", lambda: None)()
         if next_at is not None and next_at > time.time():
             if not getattr(agent, "_restore_wait_logged", False):
                 agent._restore_wait_logged = True
@@ -1539,7 +1558,6 @@ def restore_primary_runtime(agent) -> bool:
         )
     agent._restore_wait_logged = False
 
-    rt = agent._primary_runtime
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
@@ -1547,6 +1565,7 @@ def restore_primary_runtime(agent) -> bool:
         agent.requested_provider = rt.get("requested_provider", agent.provider)
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
+        agent.auth_mode = rt.get("auth_mode", "")
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -1586,6 +1605,13 @@ def restore_primary_runtime(agent) -> bool:
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
+            agent._anthropic_auth_mode = rt.get(
+                "anthropic_auth_mode", agent.auth_mode or "default"
+            )
+            agent._anthropic_auth_source = rt.get("anthropic_auth_source", "")
+            agent._anthropic_auth_ignored_sources = tuple(
+                rt.get("anthropic_auth_ignored_sources", ()) or ()
+            )
             agent.client = None
         else:
             agent.client = agent._create_openai_client(
@@ -1612,6 +1638,9 @@ def restore_primary_runtime(agent) -> bool:
         # and disables credential rotation. Reload the primary pool first; if
         # auth storage is temporarily unreadable, clear the mismatched pool.
         primary_provider = str(rt.get("provider") or "").strip().lower()
+        if strict_subscription:
+            agent._credential_pool = None
+            agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
         pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
         pool_matches_primary = pool_provider == primary_provider
@@ -1628,7 +1657,12 @@ def restore_primary_runtime(agent) -> bool:
                 pool_matches_primary = bool(primary_key) and primary_key == pool_provider
             except Exception:
                 pool_matches_primary = False
-        if pool is not None and pool_provider and not pool_matches_primary:
+        if (
+            not strict_subscription
+            and pool is not None
+            and pool_provider
+            and not pool_matches_primary
+        ):
             agent._credential_pool = None
             agent._credential_pool_entry_id = None
             try:
@@ -1657,7 +1691,7 @@ def restore_primary_runtime(agent) -> bool:
         # keep the snapshot key (the existing behavior).  Fixes #25205.
         agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
-        if pool is not None and pool.has_available():
+        if not strict_subscription and pool is not None and pool.has_available():
             entry = pool.select()
             if entry is not None:
                 entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
@@ -2406,6 +2440,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     old_model = agent.model
     old_provider = agent.provider
+    new_auth_mode = ""
+    if (new_provider or "").strip().lower() == "anthropic":
+        from agent.anthropic_adapter import get_configured_anthropic_auth_mode
+
+        new_auth_mode = get_configured_anthropic_auth_mode()
+    strict_subscription = new_auth_mode == "subscription_only"
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -2427,12 +2467,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "requested_provider",
             "base_url",
             "api_mode",
+            "auth_mode",
             "api_key",
             "client",
             "_anthropic_client",
             "_anthropic_api_key",
             "_anthropic_base_url",
             "_is_anthropic_oauth",
+            "_anthropic_auth_mode",
+            "_anthropic_auth_source",
+            "_anthropic_auth_ignored_sources",
             "_config_context_length",
         )
     }
@@ -2492,6 +2536,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "refusing to keep the previous provider's endpoint"
             )
         agent.api_mode = api_mode
+        agent.auth_mode = new_auth_mode
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -2508,7 +2553,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # logged + swallowed: the switch itself must still complete.
         old_norm = (old_provider or "").strip().lower()
         new_norm = (new_provider or "").strip().lower()
-        if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+        if strict_subscription:
+            agent._credential_pool = None
+            agent._credential_pool_entry_id = None
+        elif old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
             # A pool bound to the old provider is worse than no pool: the
             # recovery guard rejects it and every later 401/429 skips rotation.
             agent._credential_pool = None
@@ -2545,6 +2593,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         elif api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
+                resolve_anthropic_credentials,
                 resolve_anthropic_token,
                 _is_oauth_token,
             )
@@ -2552,7 +2601,17 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
             # API key — falling back would send Anthropic credentials to third-party endpoints.
             _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or agent.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or agent.api_key or "")
+            anthropic_creds = None
+            if _is_native_anthropic and strict_subscription:
+                anthropic_creds = resolve_anthropic_credentials(
+                    auth_mode=new_auth_mode,
+                    explicit_api_key=api_key or agent.api_key,
+                )
+                effective_key = anthropic_creds.token or ""
+            else:
+                effective_key = (
+                    api_key or agent.api_key or resolve_anthropic_token() or ""
+                ) if _is_native_anthropic else (api_key or agent.api_key or "")
 
             # MiniMax OAuth: swap static string for a per-request callable token
             # provider so the rebuilt client survives 15-min token expiry. See
@@ -2577,6 +2636,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 timeout=get_provider_request_timeout(agent.provider, agent.model),
             )
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
+            if anthropic_creds is not None:
+                agent.auth_mode = anthropic_creds.auth_mode
+                agent._anthropic_auth_mode = anthropic_creds.auth_mode
+                agent._anthropic_auth_source = anthropic_creds.source
+                agent._anthropic_auth_ignored_sources = tuple(
+                    anthropic_creds.ignored_sources
+                )
             agent.client = None
             agent._client_kwargs = {}
         else:
@@ -2741,6 +2807,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "auth_mode": getattr(agent, "auth_mode", ""),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
@@ -2758,6 +2825,15 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "anthropic_api_key": agent._anthropic_api_key,
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
+            "anthropic_auth_mode": getattr(
+                agent, "_anthropic_auth_mode", agent.auth_mode or "default"
+            ),
+            "anthropic_auth_source": getattr(
+                agent, "_anthropic_auth_source", ""
+            ),
+            "anthropic_auth_ignored_sources": getattr(
+                agent, "_anthropic_auth_ignored_sources", ()
+            ),
         })
 
     # ── Reset fallback state ──

@@ -1702,6 +1702,51 @@ def resolve_runtime_provider(
                 f"(providers.{requested_provider}.enabled: false)"
             )
 
+    # Strict Claude subscription routing must resolve before explicit-key and
+    # credential-pool paths so a configured API key can never win by accident.
+    if requested_provider == "anthropic":
+        model_cfg = _get_model_config()
+        from agent.anthropic_adapter import (
+            ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+            AnthropicAuthError,
+            get_configured_anthropic_auth_mode,
+            resolve_anthropic_credentials,
+        )
+
+        auth_mode = get_configured_anthropic_auth_mode(model_cfg=model_cfg)
+        if auth_mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+            cfg_base_url = ""
+            if str(model_cfg.get("provider") or "").strip().lower() == "anthropic":
+                cfg_base_url = str(model_cfg.get("base_url") or "").strip()
+            base_url = (
+                str(explicit_base_url or "").strip()
+                or cfg_base_url
+                or "https://api.anthropic.com"
+            ).rstrip("/")
+            if not base_url_host_matches(base_url, "api.anthropic.com"):
+                raise AuthError(
+                    "Anthropic subscription_only mode only supports the native "
+                    "https://api.anthropic.com endpoint."
+                )
+            try:
+                creds = resolve_anthropic_credentials(
+                    auth_mode=auth_mode,
+                    explicit_api_key=explicit_api_key,
+                )
+            except AnthropicAuthError as exc:
+                raise AuthError(str(exc)) from exc
+            return {
+                "provider": "anthropic",
+                "api_mode": "anthropic_messages",
+                "base_url": base_url,
+                "api_key": creds.token,
+                "auth_mode": creds.auth_mode,
+                "auth_source": creds.source,
+                "ignored_auth_sources": list(creds.ignored_sources),
+                "source": creds.source,
+                "requested_provider": requested_provider,
+            }
+
     if requested_provider == "moa":
         return {
             "provider": "moa",

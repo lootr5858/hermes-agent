@@ -18,6 +18,7 @@ import platform
 import secrets
 import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -66,6 +67,27 @@ def _get_anthropic_sdk():
     return _anthropic_sdk
 
 logger = logging.getLogger(__name__)
+
+ANTHROPIC_AUTH_MODE_DEFAULT = "default"
+ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY = "subscription_only"
+_ANTHROPIC_SUBSCRIPTION_IGNORED_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+class AnthropicAuthError(RuntimeError):
+    """Raised when the selected Anthropic auth mode cannot be satisfied."""
+
+
+@dataclass(frozen=True)
+class AnthropicCredentials:
+    token: Any
+    source: str
+    auth_mode: str = ANTHROPIC_AUTH_MODE_DEFAULT
+    is_oauth: bool = False
+    ignored_sources: Tuple[str, ...] = ()
 
 THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
@@ -394,6 +416,45 @@ def _detect_claude_code_version() -> str:
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 _MCP_TOOL_PREFIX = "mcp__"
+_OAUTH_TEXT_REPLACEMENTS = (
+    ("Hermes Agent", "Claude Code"),
+    ("Hermes agent", "Claude Code"),
+    ("hermes-agent", "claude-code"),
+    ("Nous Research", "Anthropic"),
+)
+
+
+def _sanitize_oauth_text(text: str) -> str:
+    for old, new in _OAUTH_TEXT_REPLACEMENTS:
+        text = text.replace(old, new)
+    return text
+
+
+def _prepend_oauth_system_context(
+    messages: List[Dict[str, Any]],
+    preamble: str,
+    cache_control: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Move the system prompt to the first user turn for OAuth plan routing."""
+    if not preamble:
+        return
+    block: Dict[str, Any] = {"type": "text", "text": preamble}
+    if cache_control:
+        block["cache_control"] = copy.deepcopy(cache_control)
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = (
+                [block, {"type": "text", "text": content}] if content else [block]
+            )
+        elif isinstance(content, list):
+            message["content"] = [block, *content]
+        else:
+            message["content"] = [block]
+        return
+    messages.insert(0, {"role": "user", "content": [block]})
 
 
 def _get_claude_code_version() -> str:
@@ -1003,6 +1064,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
                 "accessToken": access_token,
                 "refreshToken": oauth_data.get("refreshToken", ""),
                 "expiresAt": oauth_data.get("expiresAt", 0),
+                "scopes": oauth_data.get("scopes", []),
                 "source": "macos_keychain",
             }
 
@@ -1033,6 +1095,7 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
         "accessToken": access_token,
         "refreshToken": oauth_data.get("refreshToken", ""),
         "expiresAt": oauth_data.get("expiresAt", 0),
+        "scopes": oauth_data.get("scopes", []),
         "source": "claude_code_credentials_file",
     }
 
@@ -1354,7 +1417,7 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
-def resolve_anthropic_token() -> Optional[str]:
+def _resolve_anthropic_token_default() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
     Priority:
@@ -1410,6 +1473,149 @@ def resolve_anthropic_token() -> Optional[str]:
         return resolved_pool_token
 
     return None
+
+
+def normalize_anthropic_auth_mode(value: Any = None) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw in {"", "auto", "default", "api", "api_key"}:
+        return ANTHROPIC_AUTH_MODE_DEFAULT
+    if raw in {
+        "subscription",
+        "subscription_only",
+        "claude_code",
+        "claude_code_oauth",
+        "claude_code_subscription",
+        "claude_subscription",
+        "pro_max",
+        "pro_max_subscription",
+    }:
+        return ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY
+    logger.warning("Unknown Anthropic auth_mode %r; using default resolution", value)
+    return ANTHROPIC_AUTH_MODE_DEFAULT
+
+
+def get_configured_anthropic_auth_mode(
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> str:
+    raw = None
+    if isinstance(model_cfg, dict):
+        raw = model_cfg.get("auth_mode") or model_cfg.get("anthropic_auth_mode")
+    if raw is None:
+        try:
+            cfg = config
+            if cfg is None:
+                from hermes_cli.config import load_config_readonly
+
+                cfg = load_config_readonly()
+            if isinstance(cfg, dict):
+                model = cfg.get("model")
+                if isinstance(model, dict):
+                    raw = model.get("auth_mode") or model.get("anthropic_auth_mode")
+                providers = cfg.get("providers")
+                if raw is None and isinstance(providers, dict):
+                    anthropic_cfg = providers.get("anthropic")
+                    if isinstance(anthropic_cfg, dict):
+                        raw = anthropic_cfg.get("auth_mode")
+        except Exception as exc:
+            logger.debug("Failed to read Anthropic auth_mode from config: %s", exc)
+    return normalize_anthropic_auth_mode(raw)
+
+
+def _credential_scopes(creds: Dict[str, Any]) -> set[str]:
+    raw = creds.get("scopes", [])
+    if isinstance(raw, str):
+        return {part for part in raw.replace(",", " ").split() if part}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(part).strip() for part in raw if str(part).strip()}
+    return set()
+
+
+def _ignored_subscription_sources(explicit_api_key: Any = None) -> Tuple[str, ...]:
+    ignored = ["explicit_api_key"] if explicit_api_key else []
+    ignored.extend(
+        name
+        for name in _ANTHROPIC_SUBSCRIPTION_IGNORED_ENV_VARS
+        if _getenv(name).strip()
+    )
+    return tuple(ignored)
+
+
+def resolve_anthropic_subscription_credentials(
+    *,
+    explicit_api_key: Any = None,
+) -> AnthropicCredentials:
+    """Resolve refreshable Claude Code OAuth credentials or fail closed."""
+    creds = read_claude_code_credentials()
+    if not isinstance(creds, dict) or not str(creds.get("accessToken") or "").strip():
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode requires Claude Code OAuth credentials. "
+            "Run `claude /login` with your Claude subscription, then retry. "
+            "Anthropic API keys and static environment tokens are ignored."
+        )
+    if not str(creds.get("refreshToken") or "").strip():
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode requires a refresh token. "
+            "Run `claude /login` again."
+        )
+    if "user:inference" not in _credential_scopes(creds):
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode requires OAuth scope `user:inference`. "
+            "Run `claude /login` again."
+        )
+    token = _resolve_claude_code_token_from_credentials(creds)
+    if not str(token or "").strip():
+        raise AnthropicAuthError(
+            "Anthropic subscription_only mode could not refresh its Claude Code "
+            "OAuth access token. Run `claude /login` again."
+        )
+    return AnthropicCredentials(
+        token=token,
+        source=str(creds.get("source") or "claude_code_credentials"),
+        auth_mode=ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY,
+        is_oauth=True,
+        ignored_sources=_ignored_subscription_sources(explicit_api_key),
+    )
+
+
+def resolve_anthropic_credentials(
+    *,
+    auth_mode: Optional[str] = None,
+    explicit_api_key: Any = None,
+) -> AnthropicCredentials:
+    if auth_mode is None:
+        auth_mode = get_configured_anthropic_auth_mode()
+    mode = normalize_anthropic_auth_mode(auth_mode)
+    if mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+        return resolve_anthropic_subscription_credentials(
+            explicit_api_key=explicit_api_key
+        )
+    if explicit_api_key:
+        return AnthropicCredentials(
+            token=explicit_api_key,
+            source="explicit",
+            is_oauth=(
+                _is_oauth_token(explicit_api_key)
+                if isinstance(explicit_api_key, str)
+                else False
+            ),
+        )
+    token = _resolve_anthropic_token_default()
+    return AnthropicCredentials(
+        token=token or "",
+        source="default_resolution" if token else "missing",
+        is_oauth=_is_oauth_token(token) if isinstance(token, str) else False,
+    )
+
+
+def resolve_anthropic_token(*, auth_mode: Optional[str] = None) -> Optional[str]:
+    if auth_mode is None:
+        auth_mode = get_configured_anthropic_auth_mode()
+    mode = normalize_anthropic_auth_mode(auth_mode)
+    if mode == ANTHROPIC_AUTH_MODE_SUBSCRIPTION_ONLY:
+        return str(resolve_anthropic_subscription_credentials().token or "")
+    return _resolve_anthropic_token_default()
 
 
 def run_oauth_setup_token() -> Optional[str]:
@@ -2895,27 +3101,39 @@ def build_anthropic_kwargs(
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
-        # 1. Prepend Claude Code system prompt identity
-        cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
+        # Anthropic's subscription classifier expects Claude Code's top-level
+        # system identity. Keep the complete Hermes prompt in the stable first
+        # user turn, carrying forward its existing cache policy.
+        system_parts: List[str] = []
+        cache_control = None
         if isinstance(system, list):
-            system = [cc_block] + system
+            for block in system:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = block.get("text")
+                if text:
+                    system_parts.append(_sanitize_oauth_text(text))
+                if cache_control is None and isinstance(
+                    block.get("cache_control"), dict
+                ):
+                    cache_control = block["cache_control"]
         elif isinstance(system, str) and system:
-            system = [cc_block, {"type": "text", "text": system}]
-        else:
-            system = [cc_block]
+            system_parts.append(_sanitize_oauth_text(system))
 
-        # 2. Sanitize system prompt — replace product name references
-        #    to avoid Anthropic's server-side content filters.
-        for block in system:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-                text = text.replace("Hermes Agent", "Claude Code")
-                text = text.replace("Hermes agent", "Claude Code")
-                text = text.replace("hermes-agent", "claude-code")
-                text = text.replace("Nous Research", "Anthropic")
-                block["text"] = text
+        system = [{"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}]
+        if system_parts:
+            preamble = (
+                "<system_context>\n"
+                + "\n\n".join(system_parts).strip()
+                + "\n</system_context>"
+            )
+            _prepend_oauth_system_context(
+                anthropic_messages,
+                preamble,
+                cache_control=cache_control,
+            )
 
-        # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
+        # Normalize tool names so NOTHING goes on the OAuth wire with a
         #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth
         #    billing classifier treats a single-underscore ``mcp_`` tool name as
         #    a third-party-app fingerprint and rejects the request with HTTP 400
