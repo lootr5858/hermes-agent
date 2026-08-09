@@ -62,6 +62,32 @@ class TestContextFileCwd:
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
 
+class TestUserContextTier1SystemPrompt:
+    def test_injected_without_active_memory_provider(self):
+        agent = _make_agent(_memory_manager=None)
+        with patch(
+            "run_agent.load_user_context_tier1",
+            return_value="TIER ONE BRAIN BOOTSTRAP",
+            create=True,
+        ) as load_tier_one:
+            stable = _stable_prompt(agent)
+
+        assert "TIER ONE BRAIN BOOTSTRAP" in stable
+        load_tier_one.assert_called_once_with()
+
+    def test_not_duplicated_with_active_memory_provider(self):
+        agent = _make_agent(_memory_manager=SimpleNamespace(providers=[object()]))
+        with patch(
+            "run_agent.load_user_context_tier1",
+            return_value="TIER ONE BRAIN BOOTSTRAP",
+            create=True,
+        ) as load_tier_one:
+            stable = _stable_prompt(agent)
+
+        assert "TIER ONE BRAIN BOOTSTRAP" not in stable
+        load_tier_one.assert_not_called()
+
+
 def _stable_prompt(agent):
     with (
         patch("run_agent.load_soul_md", return_value=""),

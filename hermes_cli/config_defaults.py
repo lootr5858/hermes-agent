@@ -1675,6 +1675,9 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Optional absolute root whose BOOTSTRAP.md is loaded as routed
+        # tier-one user context by the local brain guardrail.
+        "brain_root": "",
         # Return freed glibc allocator pages after long-running agent/TUI
         # cleanup boundaries. Unsupported platforms are safe no-ops.
         "memory_trim": {
