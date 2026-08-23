@@ -11,6 +11,7 @@ from gateway.runtime_footer import (
     _home_relative_cwd,
     _model_short,
     build_footer_line,
+    conversation_usage,
     format_runtime_footer,
     resolve_footer_config,
 )
@@ -72,6 +73,75 @@ def test_format_footer_skips_missing_context_length():
     assert "%" not in out
     assert "gpt-5.4" in out
     assert "/tmp/wd" in out
+
+
+def test_format_footer_tokens_and_cost():
+    out = format_runtime_footer(
+        model="m",
+        context_tokens=0,
+        context_length=None,
+        message_input_tokens=12_300,
+        message_output_tokens=678,
+        conversation_input_tokens=80_000,
+        conversation_output_tokens=12_000,
+        conversation_cost_usd=0.00464,
+        conversation_cost_status="estimated",
+        fields=("tokens_io", "cost"),
+    )
+    assert out == "msg ↑12.3K ↓678 / total ↑80K ↓12K · cost ~$0.0046"
+
+
+@pytest.mark.parametrize(
+    "status,cost,expected",
+    [("included", 0, "cost included"), ("unknown", 0.25, "cost unknown")],
+)
+def test_format_footer_cost_statuses(status, cost, expected):
+    out = format_runtime_footer(
+        model="m",
+        context_tokens=0,
+        context_length=None,
+        conversation_cost_usd=cost,
+        conversation_cost_status=status,
+        fields=("cost",),
+    )
+    assert out == expected
+
+
+def test_conversation_usage_follows_compression_only(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="gateway")
+        db.update_token_counts(
+            "root", input_tokens=100, output_tokens=20,
+            estimated_cost_usd=0, cost_status="included", api_call_count=1,
+        )
+        db.end_session("root", "compression")
+        db.create_session("tip", source="gateway", parent_session_id="root")
+        db.update_token_counts(
+            "tip", input_tokens=200, output_tokens=30,
+            estimated_cost_usd=0.00464, cost_status="estimated", api_call_count=1,
+        )
+        db.create_session(
+            "delegate", source="delegate", parent_session_id="tip",
+            model_config={"_delegate_from": "tip"},
+        )
+        db.update_token_counts(
+            "delegate", input_tokens=999, output_tokens=999,
+            estimated_cost_usd=9.99, cost_status="estimated", api_call_count=1,
+        )
+
+        usage = conversation_usage(db, "tip")
+    finally:
+        db.close()
+
+    assert usage == {
+        "input_tokens": 300,
+        "output_tokens": 50,
+        "cost_usd": pytest.approx(0.00464),
+        "cost_status": "estimated",
+    }
 
 
 # ---------------------------------------------------------------------------

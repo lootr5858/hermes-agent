@@ -9,12 +9,14 @@ Config (``~/.hermes/config.yaml``)::
     display:
       runtime_footer:
         enabled: true                       # off by default
-        fields: [model, context_pct, cwd]   # order shown; drop any to hide
+        fields: [model, context_pct, tokens_io, cost, cwd]
 
 Available fields:
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
+    tokens_io    — message and conversation input/output tokens
+    cost         — estimated API cost, ``included``, or ``unknown``
     cwd          — home-relative working dir (``~``)
 
 ``latency`` is opt-in: it is NOT in the default field set, so a footer whose
@@ -35,7 +37,10 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from typing import Any, Iterable, Optional
+
+from agent.usage_pricing import format_cost_label, format_token_count_compact
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
@@ -115,6 +120,12 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    message_input_tokens: int = 0,
+    message_output_tokens: int = 0,
+    conversation_input_tokens: int = 0,
+    conversation_output_tokens: int = 0,
+    conversation_cost_usd: Optional[float] = None,
+    conversation_cost_status: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -137,6 +148,23 @@ def format_runtime_footer(
             # timing (call sites that don't measure) or the value is negative.
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
+        elif field == "tokens_io":
+            parts.append(
+                "msg "
+                f"↑{format_token_count_compact(message_input_tokens)} "
+                f"↓{format_token_count_compact(message_output_tokens)} / total "
+                f"↑{format_token_count_compact(conversation_input_tokens)} "
+                f"↓{format_token_count_compact(conversation_output_tokens)}"
+            )
+        elif field == "cost":
+            if conversation_cost_status == "included":
+                parts.append("cost included")
+            elif conversation_cost_status == "unknown":
+                parts.append("cost unknown")
+            elif conversation_cost_usd is not None:
+                parts.append(
+                    f"cost {format_cost_label(Decimal(str(conversation_cost_usd)))}"
+                )
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
@@ -157,6 +185,12 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    message_input_tokens: int = 0,
+    message_output_tokens: int = 0,
+    conversation_input_tokens: int = 0,
+    conversation_output_tokens: int = 0,
+    conversation_cost_usd: Optional[float] = None,
+    conversation_cost_status: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -177,5 +211,44 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        message_input_tokens=message_input_tokens,
+        message_output_tokens=message_output_tokens,
+        conversation_input_tokens=conversation_input_tokens,
+        conversation_output_tokens=conversation_output_tokens,
+        conversation_cost_usd=conversation_cost_usd,
+        conversation_cost_status=conversation_cost_status,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
+
+
+def conversation_usage(session_db: Any, session_id: str) -> dict[str, Any]:
+    """Return usage for one conversation across compression continuations."""
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "cost_status": None,
+    }
+    statuses: set[str] = set()
+    for lineage_id in session_db.get_compression_lineage(session_id):
+        row = session_db.get_session(lineage_id)
+        if not row:
+            continue
+        input_tokens = int(row.get("input_tokens") or 0)
+        output_tokens = int(row.get("output_tokens") or 0)
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        raw_cost = row.get("actual_cost_usd")
+        if raw_cost is None:
+            raw_cost = row.get("estimated_cost_usd")
+        totals["cost_usd"] += float(raw_cost or 0)
+        if input_tokens or output_tokens or int(row.get("api_call_count") or 0):
+            statuses.add(str(row.get("cost_status") or "unknown"))
+
+    if "unknown" in statuses:
+        totals["cost_status"] = "unknown"
+    elif statuses - {"included"}:
+        totals["cost_status"] = "estimated"
+    elif "included" in statuses:
+        totals["cost_status"] = "included"
+    return totals

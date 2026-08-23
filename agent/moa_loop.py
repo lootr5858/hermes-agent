@@ -374,6 +374,8 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
             out["api_key"] = rt["api_key"]
         if rt.get("api_mode"):
             out["api_mode"] = rt["api_mode"]
+        if rt.get("auth_mode"):
+            out["auth_mode"] = rt["auth_mode"]
         request_overrides = rt.get("request_overrides")
         if isinstance(request_overrides, dict):
             extra_body = request_overrides.get("extra_body")
@@ -580,6 +582,8 @@ def _run_reference(
             # ``copilot-language-server`` integrator even though standalone
             # Copilot calls work.
             extra_headers = {"x-initiator": "user"}
+        call_runtime = dict(runtime)
+        call_runtime.pop("auth_mode", None)
         response = call_llm(
             task="moa_reference",
             messages=messages,
@@ -588,7 +592,7 @@ def _run_reference(
             timeout=reference_timeout,
             reasoning_config=_slot_reasoning_config(slot),
             extra_headers=extra_headers,
-            **runtime,
+            **call_runtime,
         )
         usage = CanonicalUsage()
         raw_usage = getattr(response, "usage", None)
@@ -615,6 +619,7 @@ def _run_reference(
                 provider=runtime.get("provider"),
                 base_url=runtime.get("base_url"),
                 api_key=runtime.get("api_key"),
+                auth_mode=runtime.get("auth_mode"),
             )
             cost_usd = cost.amount_usd
             cost_status = cost.status
@@ -1333,6 +1338,8 @@ def aggregate_moa_context(
 
     agg_label = _slot_label(aggregator)
     agg_runtime = _slot_runtime(aggregator)
+    agg_call_runtime = dict(agg_runtime)
+    agg_call_runtime.pop("auth_mode", None)
     # Pin the live agent disable onto synthesis decoration so mid-session
     # config flips cannot re-enable markers on this path alone (#76085).
     # Same not-None guard as _run_reference: stamping None would be a no-op
@@ -1343,7 +1350,7 @@ def aggregate_moa_context(
     )
     if _agg_cache_disabled is not None:
         agg_cache_runtime = {
-            **agg_runtime,
+            **agg_call_runtime,
             "_cache_disabled": _agg_cache_disabled,
         }
     # Thread the agent's configured cache TTL into the synthesis decoration
@@ -1370,7 +1377,7 @@ def aggregate_moa_context(
             messages=agg_messages,
             temperature=aggregator_temperature,
             reasoning_config=_aggregator_reasoning_config(aggregator),
-            **agg_runtime,
+            **agg_call_runtime,
         )
         synthesis = _extract_text(response)
     except Exception as exc:
@@ -1579,6 +1586,7 @@ class MoAChatCompletions:
 
         self._pending_reference_usage: Any = CanonicalUsage()
         self._pending_reference_cost: Any = None
+        self._pending_reference_cost_unknown = False
         # Guards pending usage/cost against concurrent late-accounting
         # callbacks (see _record_late_reference_accounting), which fire on
         # executor worker threads after an interrupted fan-out returns.
@@ -1609,23 +1617,25 @@ class MoAChatCompletions:
         # 'display' | 'full'), refreshed from config on every create().
         self._privacy_mode: str = ""
 
-    def consume_reference_usage(self) -> tuple[Any, Any]:
+    def consume_reference_usage(self) -> tuple[Any, Any, bool]:
         """Pop pending reference-fan-out usage + cost, resetting both to empty.
 
-        Returns ``(CanonicalUsage, cost_usd_or_None)`` for the most recent
-        ``create()`` and clears the pending values, so a subsequent read (e.g.
-        a streaming retry re-entering accounting) cannot double-count. Usage is
-        always a ``CanonicalUsage`` (zeroed if none); cost is a summed-dollars
-        float or ``None`` when no advisor could be priced.
+        Returns ``(CanonicalUsage, cost_usd_or_None, cost_unknown)`` for the
+        most recent ``create()`` and clears the pending values, so a subsequent
+        read (e.g. a streaming retry re-entering accounting) cannot double-count.
+        Usage is always a ``CanonicalUsage`` (zeroed if none); cost is summed
+        dollars or ``None`` when no advisor could be priced.
         """
         from agent.usage_pricing import CanonicalUsage
 
         with self._accounting_lock:
             usage = self._pending_reference_usage or CanonicalUsage()
             cost = self._pending_reference_cost
+            cost_unknown = self._pending_reference_cost_unknown
             self._pending_reference_usage = CanonicalUsage()
             self._pending_reference_cost = None
-        return usage, cost
+            self._pending_reference_cost_unknown = False
+        return usage, cost, cost_unknown
 
     def last_reference_metrics(self) -> Any:
         """Per-advisor metrics from the most recent fan-out, or None.
@@ -1660,6 +1670,8 @@ class MoAChatCompletions:
                 self._pending_reference_cost = (
                     self._pending_reference_cost or 0
                 ) + accounting.cost_usd
+            if accounting.cost_status == "unknown":
+                self._pending_reference_cost_unknown = True
         logger.debug(
             "MoA: recorded late accounting for interrupted reference %s", label
         )
@@ -1760,6 +1772,11 @@ class MoAChatCompletions:
         tools: Any = agg_kwargs.get("tools")
         extra_body: Any = agg_kwargs.get("extra_body")
         agg_runtime = _slot_runtime(aggregator)
+        if agg_runtime.get("auth_mode"):
+            self.last_aggregator_slot = {
+                **aggregator,
+                "auth_mode": agg_runtime["auth_mode"],
+            }
         try:
             from agent.agent_runtime_helpers import (
                 plan_cache_sections_for_destination,
@@ -1855,10 +1872,12 @@ class MoAChatCompletions:
         # _slot_runtime may carry the provider's request_overrides.extra_body;
         # pop it and merge with the caller's extra_body (caller wins) so the
         # explicit kwarg below never collides with **agg_runtime.
+        agg_call_runtime = dict(agg_runtime)
         agg_extra_body = _merge_slot_extra_body(
-            agg_runtime.pop("extra_body", None),
+            agg_call_runtime.pop("extra_body", None),
             extra_body,
         )
+        agg_call_runtime.pop("auth_mode", None)
         _agg_response = call_llm(
             task="moa_aggregator",
             messages=agg_messages,
@@ -1870,7 +1889,7 @@ class MoAChatCompletions:
             # policy exactly as the direct create() path does (#64187).
             reasoning_config=_aggregator_reasoning_config(aggregator),
             **stream_kwargs,
-            **agg_runtime,
+            **agg_call_runtime,
         )
         # Non-streaming path (quiet mode / eval / subagents): the aggregator
         # output is available inline, so capture it into the pending trace now.
@@ -2152,12 +2171,15 @@ class MoAChatCompletions:
             # NOT be repriced at the aggregator's rate.
             _ref_usage = CanonicalUsage()
             _ref_cost: Any = None
+            _ref_cost_unknown = False
             for _lbl, _txt, _acct in reference_outputs:
                 if isinstance(_acct, _RefAccounting):
                     if isinstance(_acct.usage, CanonicalUsage):
                         _ref_usage = _ref_usage + _acct.usage
                     if _acct.cost_usd is not None:
                         _ref_cost = (_ref_cost or 0) + _acct.cost_usd
+                    if _acct.cost_status == "unknown":
+                        _ref_cost_unknown = True
             with self._accounting_lock:
                 # Fold (don't overwrite): a late-completing interrupted
                 # reference from a PREVIOUS turn may have deposited its real
@@ -2169,6 +2191,8 @@ class MoAChatCompletions:
                     self._pending_reference_cost = (
                         self._pending_reference_cost or 0
                     ) + _ref_cost
+                if _ref_cost_unknown:
+                    self._pending_reference_cost_unknown = True
             # Stash the full reference fan-out for trace persistence. The
             # aggregator input/label are filled in below once agg_messages is
             # built; the aggregator OUTPUT is stitched in by the caller

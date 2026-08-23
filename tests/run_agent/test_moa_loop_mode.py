@@ -1233,13 +1233,15 @@ moa:
         "openrouter:advisor",
         moa_loop._RefAccounting(CanonicalUsage(input_tokens=33), 0.42),
     )
-    usage, cost = facade.consume_reference_usage()
+    usage, cost, cost_unknown = facade.consume_reference_usage()
     assert usage.input_tokens == 33
     assert cost == pytest.approx(0.42)
+    assert cost_unknown is False
     # And consume() drained it — no double count.
-    usage2, cost2 = facade.consume_reference_usage()
+    usage2, cost2, cost_unknown2 = facade.consume_reference_usage()
     assert usage2.input_tokens == 0
     assert cost2 is None
+    assert cost_unknown2 is False
 
 
 class _CountingCtxLen:

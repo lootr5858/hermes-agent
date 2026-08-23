@@ -39,6 +39,21 @@ class TestSlotRuntimeApiMode:
         assert result["base_url"] == "https://api.githubcopilot.com"
         assert result["api_key"] == "test-key"
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_slot_runtime_retains_auth_mode_for_billing(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "oauth-token",
+            "api_mode": "anthropic_messages",
+            "auth_mode": "subscription_only",
+        }
+        from agent.moa_loop import _slot_runtime
+
+        result = _slot_runtime({"provider": "anthropic", "model": "claude-opus-5"})
+        assert result["auth_mode"] == "subscription_only"
+
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_slot_runtime_omits_api_mode_when_empty(self, mock_resolve):
@@ -89,6 +104,42 @@ def test_run_reference_passes_slot_extra_body(monkeypatch):
     assert label == "dashscope:qwen3.7-max"
     assert text == "advisor"
     assert captured["extra_body"] == {"enable_thinking": False}
+
+
+def test_run_reference_uses_auth_mode_for_cost_but_not_request(monkeypatch):
+    from agent import moa_loop
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        response = _response("advisor")
+        response.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+        return response
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_mode": "anthropic_messages",
+            "auth_mode": "subscription_only",
+        },
+    )
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        moa_loop, "_maybe_apply_moa_cache_control", lambda messages, runtime, **kwargs: messages
+    )
+
+    _, _, accounting = moa_loop._run_reference(
+        {"provider": "anthropic", "model": "claude-opus-5"},
+        [{"role": "user", "content": "hello"}],
+    )
+
+    assert "auth_mode" not in captured
+    assert accounting.cost_status == "included"
+    assert accounting.cost_usd == 0
 
 
 def test_moa_aggregator_merges_slot_extra_body_with_caller_override(tmp_path, monkeypatch):

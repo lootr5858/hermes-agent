@@ -6355,6 +6355,8 @@ class TurnRunner:
             )
 
         _approval_session_key = ctx.session_key or ""
+        _message_input_start = int(getattr(agent, "session_input_tokens", 0) or 0)
+        _message_output_start = int(getattr(agent, "session_output_tokens", 0) or 0)
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
@@ -6477,12 +6479,24 @@ class TurnRunner:
         _last_prompt_toks = 0
         _input_toks = 0
         _output_toks = 0
+        _message_input_toks = 0
+        _message_output_toks = 0
         _context_length = 0
         _agent = ctx.agent_holder[0]
         if _agent and hasattr(_agent, "context_compressor"):
             _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
             _input_toks = getattr(_agent, "session_prompt_tokens", 0)
             _output_toks = getattr(_agent, "session_completion_tokens", 0)
+            _message_input_toks = max(
+                0,
+                int(getattr(_agent, "session_input_tokens", 0) or 0)
+                - _message_input_start,
+            )
+            _message_output_toks = max(
+                0,
+                int(getattr(_agent, "session_output_tokens", 0) or 0)
+                - _message_output_start,
+            )
             _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
         _resolved_model = getattr(_agent, "model", None) if _agent else None
 
@@ -6619,6 +6633,8 @@ class TurnRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "message_input_tokens": _message_input_toks,
+                "message_output_tokens": _message_output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
@@ -6700,6 +6716,8 @@ class TurnRunner:
             "last_prompt_tokens": _last_prompt_toks,
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
+            "message_input_tokens": _message_input_toks,
+            "message_output_tokens": _message_output_toks,
             "model": _resolved_model,
             "context_length": _context_length,
             "session_id": effective_session_id,
@@ -20381,7 +20399,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
+                from gateway.runtime_footer import (
+                    build_footer_line as _bfl,
+                    conversation_usage as _conversation_usage,
+                )
+                _footer_usage = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": None,
+                    "cost_status": None,
+                }
+                _footer_db = getattr(self._session_db, "_db", self._session_db)
+                if _footer_db is not None and session_entry.session_id:
+                    _footer_usage = await asyncio.to_thread(
+                        _conversation_usage,
+                        _footer_db,
+                        session_entry.session_id,
+                    )
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -20390,6 +20424,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    message_input_tokens=agent_result.get("message_input_tokens", 0) or 0,
+                    message_output_tokens=agent_result.get("message_output_tokens", 0) or 0,
+                    conversation_input_tokens=_footer_usage["input_tokens"],
+                    conversation_output_tokens=_footer_usage["output_tokens"],
+                    conversation_cost_usd=_footer_usage["cost_usd"],
+                    conversation_cost_status=_footer_usage["cost_status"],
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

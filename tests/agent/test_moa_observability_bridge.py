@@ -87,9 +87,20 @@ class TestLastReferenceMetricsAccessor:
 
         client.last_reference_metrics()
 
-        usage, cost = client.consume_reference_usage()
+        usage, cost, cost_unknown = client.consume_reference_usage()
         assert usage.input_tokens == 5
         assert cost == 0.05
+        assert cost_unknown is False
+
+    def test_unknown_reference_pricing_survives_known_partial_cost(self):
+        client = self._client()
+        client.chat.completions._pending_reference_cost = 0.05
+        client.chat.completions._pending_reference_cost_unknown = True
+
+        _, cost, cost_unknown = client.consume_reference_usage()
+
+        assert cost == 0.05
+        assert cost_unknown is True
 
 
 class TestConversationLoopHelper:

@@ -4039,10 +4039,15 @@ def run_conversation(
                     # usage, so without this the entire advisor spend — usually
                     # the bulk of a MoA turn — is invisible in token counts.
                     _moa_ref_cost = None
+                    _moa_ref_cost_unknown = False
                     _moa_client = getattr(agent, "client", None)
                     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
                         try:
-                            _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
+                            (
+                                _ref_usage,
+                                _moa_ref_cost,
+                                _moa_ref_cost_unknown,
+                            ) = _moa_client.consume_reference_usage()
                             if _ref_usage is not None:
                                 canonical_usage = canonical_usage + _ref_usage
                         except Exception as _moa_acct_exc:  # pragma: no cover - defensive
@@ -4202,6 +4207,11 @@ def run_conversation(
                         provider=_agg_cost_provider,
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
+                        auth_mode=(
+                            _agg_slot.get("auth_mode")
+                            if _agg_slot
+                            else getattr(agent, "auth_mode", None)
+                        ),
                     )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
@@ -4212,7 +4222,15 @@ def run_conversation(
                             agent.session_estimated_cost_usd += float(_moa_ref_cost)
                         except (TypeError, ValueError):  # pragma: no cover - defensive
                             pass
-                    agent.session_cost_status = cost_result.status
+                    _moa_cost_status = cost_result.status
+                    if _moa_ref_cost_unknown:
+                        _moa_cost_status = "unknown"
+                    elif (
+                        cost_result.status == "included"
+                        and _moa_ref_cost not in (None, 0)
+                    ):
+                        _moa_cost_status = "estimated"
+                    agent.session_cost_status = _moa_cost_status
                     agent.session_cost_source = cost_result.source
 
                     # Persist token counts to session DB for /insights.
@@ -4257,12 +4275,12 @@ def run_conversation(
                                 cache_write_tokens=canonical_usage.cache_write_tokens,
                                 reasoning_tokens=canonical_usage.reasoning_tokens,
                                 estimated_cost_usd=_cost_delta,
-                                cost_status=cost_result.status,
+                                cost_status=_moa_cost_status,
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
                                 billing_mode="subscription_included"
-                                if cost_result.status == "included" else None,
+                                if _moa_cost_status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
                             )

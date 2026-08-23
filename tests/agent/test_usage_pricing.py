@@ -459,6 +459,28 @@ class TestSubscriptionIncludedNotes:
         assert len(result.notes) > 0
         assert any("subscription" in note.lower() for note in result.notes)
 
+    def test_anthropic_subscription_only_is_included(self):
+        result = estimate_usage_cost(
+            "claude-opus-5",
+            CanonicalUsage(input_tokens=1000, output_tokens=500),
+            provider="anthropic",
+            auth_mode="subscription_only",
+        )
+        assert result.status == "included"
+        assert result.amount_usd == Decimal("0")
+
+
+def test_current_moa_models_have_official_pricing():
+    opus = get_pricing_entry("claude-opus-5", provider="anthropic")
+    flash = get_pricing_entry("gemini-3.7-flash", provider="gemini")
+
+    assert opus is not None
+    assert opus.input_cost_per_million == Decimal("5.00")
+    assert opus.output_cost_per_million == Decimal("25.00")
+    assert flash is not None
+    assert flash.input_cost_per_million == Decimal("0.75")
+    assert flash.output_cost_per_million == Decimal("3.75")
+
 
 def test_normalize_usage_reads_kimi_top_level_cached_tokens():
     """Kimi/Moonshot's native API reports context-cache hits as a top-level

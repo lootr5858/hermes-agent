@@ -212,6 +212,18 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ),
     (
         "anthropic",
+        "claude-opus-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-08",
+    ),
+    (
+        "anthropic",
         "claude-opus-4-8-fast",
     ): PricingEntry(
         input_cost_per_million=Decimal("10.00"),
@@ -564,6 +576,17 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://ai.google.dev/gemini-api/docs/pricing",
         pricing_version="google-pricing-2026-07-28",
+    ),
+    (
+        "google",
+        "gemini-3.7-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("3.75"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-08-promo",
     ),
     (
         "google",
@@ -1057,6 +1080,7 @@ def resolve_billing_route(
     model_name: str,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    auth_mode: Optional[str] = None,
 ) -> BillingRoute:
     provider_name = (provider or "").strip().lower()
     base = (base_url or "").strip().lower()
@@ -1073,6 +1097,8 @@ def resolve_billing_route(
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
+    if provider_name == "anthropic" and auth_mode == "subscription_only":
+        return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # "openai-api" is the picker/registry slug for direct api.openai.com; it
@@ -1430,8 +1456,11 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    auth_mode: Optional[str] = None,
 ) -> CostResult:
-    route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
+    route = resolve_billing_route(
+        model_name, provider=provider, base_url=base_url, auth_mode=auth_mode
+    )
     if route.billing_mode == "subscription_included":
         return CostResult(
             amount_usd=_ZERO,

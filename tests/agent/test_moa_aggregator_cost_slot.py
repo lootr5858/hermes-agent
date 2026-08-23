@@ -98,3 +98,32 @@ def test_client_exposes_last_aggregator_slot(moa_config, monkeypatch):
     assert slot is not None
     assert slot["model"] == "anthropic/claude-opus-4.8"
     assert slot["provider"] == "openrouter"
+
+
+def test_aggregator_slot_retains_auth_mode_without_forwarding_it(moa_config, monkeypatch):
+    from agent import moa_loop
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        if kwargs.get("task") == "moa_aggregator":
+            captured.update(kwargs)
+        return _response("ok")
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_mode": "anthropic_messages",
+            "auth_mode": "subscription_only",
+        },
+    )
+    monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
+
+    facade = moa_loop.MoAChatCompletions("closed")
+    facade.create(model="closed", messages=[{"role": "user", "content": "hello"}])
+
+    assert facade.last_aggregator_slot["auth_mode"] == "subscription_only"
+    assert "auth_mode" not in captured
