@@ -88,12 +88,12 @@ def test_format_footer_tokens_and_cost():
         conversation_cost_status="estimated",
         fields=("tokens_io", "cost"),
     )
-    assert out == "msg ↑12.3K ↓678 / total ↑80K ↓12K · cost ~$0.0046"
+    assert out == "msg ↑12.3K ↓678 / total ↑80K ↓12K · ~$0.0046"
 
 
 @pytest.mark.parametrize(
     "status,cost,expected",
-    [("included", 0, "cost included"), ("unknown", 0.25, "cost unknown")],
+    [("included", 0, "included"), ("unknown", 0.25, "unknown")],
 )
 def test_format_footer_cost_statuses(status, cost, expected):
     out = format_runtime_footer(

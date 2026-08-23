@@ -158,13 +158,11 @@ def format_runtime_footer(
             )
         elif field == "cost":
             if conversation_cost_status == "included":
-                parts.append("cost included")
+                parts.append("included")
             elif conversation_cost_status == "unknown":
-                parts.append("cost unknown")
+                parts.append("unknown")
             elif conversation_cost_usd is not None:
-                parts.append(
-                    f"cost {format_cost_label(Decimal(str(conversation_cost_usd)))}"
-                )
+                parts.append(format_cost_label(Decimal(str(conversation_cost_usd))))
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
