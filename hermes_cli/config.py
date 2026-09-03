@@ -2635,10 +2635,10 @@ def _env_expand_match(m: re.Match) -> str:
     (``tools/mcp_tool.py::_env_ref_name``):
 
     * ``${VAR}`` — legacy bare name, resolved via ``os.environ``.
-    * ``${env:VAR}`` — Cursor-style SecretRef, same resolution after the
-      ``env:`` prefix is stripped.  Before this, the prefixed form worked in
-      MCP config but stayed a literal string in config.yaml — a confusing
-      half-support.
+    * ``${env:VAR}`` — Cursor-style SecretRef, resolved through the existing
+      scope/environment/``HERMES_HOME/.env`` lookup. Before this, the prefixed
+      form worked in MCP config but stayed a literal string in config.yaml — a
+      confusing half-support.
 
     Other SecretRef sources (``file:``, ``bitwarden:``, ``vault:``, ...)
     are NOT resolved here — external secret backends inject their values
@@ -2652,12 +2652,12 @@ def _env_expand_match(m: re.Match) -> str:
         name = inner[len("env:"):].strip()
         if not name:
             return raw
-        val = os.environ.get(name)
+        val = get_env_value(name)
         if val is not None:
             return val
         logger.warning(
-            "Config ref %r: %s is not set (check ~/.hermes/.env); "
-            "keeping the literal placeholder", raw, name,
+            "Config ref %r: %s is not set (check %s); "
+            "keeping the literal placeholder", raw, name, get_env_path(),
         )
         return raw
     if ":" in inner and re.match(r"^[a-z][a-z0-9_-]*:", inner):

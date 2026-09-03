@@ -15,6 +15,19 @@ from hermes_cli.config import (
 )
 
 
+def test_env_ref_reads_hermes_home_dotenv_before_process_load(
+    tmp_path, monkeypatch, caplog
+):
+    (tmp_path / ".env").write_text(
+        "EARLY_CONFIG_SECRET=from-dotenv\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("EARLY_CONFIG_SECRET", raising=False)
+
+    assert _expand_env_vars("${env:EARLY_CONFIG_SECRET}") == "from-dotenv"
+    assert "EARLY_CONFIG_SECRET is not set" not in caplog.text
+
+
 
 
 
