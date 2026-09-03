@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -75,7 +77,7 @@ class TestUserContextTier1SystemPrompt:
         assert "TIER ONE BRAIN BOOTSTRAP" in stable
         load_tier_one.assert_called_once_with()
 
-    def test_not_duplicated_with_active_memory_provider(self):
+    def test_injected_once_with_active_memory_provider(self):
         agent = _make_agent(_memory_manager=SimpleNamespace(providers=[object()]))
         with patch(
             "run_agent.load_user_context_tier1",
@@ -84,8 +86,35 @@ class TestUserContextTier1SystemPrompt:
         ) as load_tier_one:
             stable = _stable_prompt(agent)
 
-        assert "TIER ONE BRAIN BOOTSTRAP" not in stable
-        load_tier_one.assert_not_called()
+        assert stable.count("TIER ONE BRAIN BOOTSTRAP") == 1
+        load_tier_one.assert_called_once_with()
+
+    def test_loader_failure_propagates(self):
+        with patch(
+            "run_agent.load_user_context_tier1",
+            side_effect=RuntimeError("brain unavailable"),
+            create=True,
+        ):
+            with pytest.raises(RuntimeError, match="brain unavailable"):
+                _stable_prompt(_make_agent())
+
+    def test_brain_and_soul_are_both_stable_context(self):
+        agent = _make_agent(load_soul_identity=True)
+        with (
+            patch("run_agent.load_soul_md", return_value="HERMES SOUL"),
+            patch(
+                "run_agent.load_user_context_tier1",
+                return_value="TIER ONE BRAIN BOOTSTRAP",
+                create=True,
+            ),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            stable = build_system_prompt_parts(agent)["stable"]
+
+        assert "HERMES SOUL" in stable
+        assert stable.count("TIER ONE BRAIN BOOTSTRAP") == 1
 
 
 def _stable_prompt(agent):

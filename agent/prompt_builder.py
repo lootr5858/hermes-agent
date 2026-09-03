@@ -2358,85 +2358,96 @@ def load_soul_md(
 
 
 def load_user_context_tier1() -> Optional[str]:
-    """Load only the configured brain BOOTSTRAP.md as tier-one context."""
+    """Load the configured brain's complete always-required context bundle."""
     try:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
     except Exception as exc:
-        logger.warning(
-            "Could not read context.brain_root; tier-one context was not loaded: %s",
-            exc,
-        )
-        return None
+        raise RuntimeError("Could not read context.brain_root") from exc
 
     context = config.get("context") if isinstance(config, dict) else None
     brain_root = context.get("brain_root") if isinstance(context, dict) else None
     if brain_root is None or (isinstance(brain_root, str) and not brain_root.strip()):
-        logger.warning(
-            "context.brain_root is required for tier-one user context; "
-            "nothing was loaded"
-        )
         return None
     if not isinstance(brain_root, str):
-        logger.warning(
-            "context.brain_root must be a string, got %s; nothing was loaded",
-            type(brain_root).__name__,
+        raise RuntimeError(
+            "context.brain_root must be a non-empty absolute path string, "
+            f"got {type(brain_root).__name__}"
         )
-        return None
 
     root = Path(brain_root.strip())
     if not root.is_absolute():
-        logger.warning(
-            "context.brain_root must be an absolute path, got %s; nothing was loaded",
-            root,
+        raise RuntimeError(
+            f"context.brain_root must be an absolute path, got {root}"
         )
-        return None
     if not root.is_dir():
-        logger.warning(
-            "Configured context.brain_root is not a directory: %s; nothing was loaded",
-            root,
+        raise RuntimeError(
+            f"Configured context.brain_root is not a directory: {root}"
         )
-        return None
 
-    bootstrap = root / "BOOTSTRAP.md"
-    if not bootstrap.is_file():
-        logger.warning(
-            "Configured brain bootstrap is missing: %s; nothing was loaded",
-            bootstrap,
+    core_dir = root / "agents" / "core"
+    if not core_dir.is_dir():
+        raise RuntimeError(f"Configured brain core directory is missing: {core_dir}")
+    core_files = sorted(core_dir.glob("*.md"), key=lambda path: path.name)
+    if not core_files:
+        raise RuntimeError(
+            f"Configured brain core directory has no Markdown files: {core_dir}"
         )
-        return None
+
+    required_files = [
+        root / "BOOTSTRAP.md",
+        root / "agents" / "BOOTSTRAP.md",
+        *core_files,
+        root / "user" / "BOOTSTRAP.md",
+        root / "user" / "preferences.md",
+        root / "user" / "context-routing.md",
+    ]
+    missing = [path for path in required_files if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Configured brain always-required file is missing: {missing[0]}"
+        )
 
     resolved_root = root.resolve()
-    resolved_bootstrap = bootstrap.resolve()
-    try:
-        resolved_bootstrap.relative_to(resolved_root)
-    except ValueError:
-        logger.warning(
-            "Configured brain bootstrap resolves outside configured "
-            "context.brain_root: %s; nothing was loaded",
-            resolved_bootstrap,
-        )
-        return None
+    sections = []
+    for path in required_files:
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Configured brain file resolves outside context.brain_root: "
+                f"{resolved_path}"
+            ) from exc
+        try:
+            content = resolved_path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read configured brain file: {resolved_path}"
+            ) from exc
+        if not content:
+            raise RuntimeError(f"Configured brain file is empty: {resolved_path}")
 
-    try:
-        content = resolved_bootstrap.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        logger.warning(
-            "Could not read configured brain bootstrap %s; nothing was loaded: %s",
-            resolved_bootstrap,
-            exc,
-        )
-        return None
-    if not content:
-        logger.warning(
-            "Configured brain bootstrap is empty: %s; nothing was loaded",
-            resolved_bootstrap,
-        )
-        return None
+        label = f"brain/{path.relative_to(root).as_posix()}"
+        scanned = _scan_context_content(content, label)
+        if scanned.startswith("[BLOCKED:"):
+            raise RuntimeError(f"Configured brain file failed content scan: {label}")
+        sections.append(f"## {label}\n\n{scanned}")
 
-    label = "brain/BOOTSTRAP.md"
-    scanned = _scan_context_content(content, label)
+    routed = (
+        "# Routed Brain Context (tier-1, always-required)\n\n"
+        "This block contains the complete always-required brain context. "
+        "Load any additional brain files only through its explicit routing.\n\n"
+        + "\n\n".join(sections)
+    )
+    max_chars = _get_context_file_max_chars()
+    if len(routed) > max_chars:
+        raise RuntimeError(
+            "Configured brain always-required bundle exceeds the context-file "
+            f"limit: {len(routed)} > {max_chars} characters"
+        )
+
     sentinel = get_hermes_home() / ".brain-bootstrap-was-present"
     try:
         sentinel.parent.mkdir(parents=True, exist_ok=True)
@@ -2444,18 +2455,7 @@ def load_user_context_tier1() -> Optional[str]:
     except Exception as exc:
         logger.debug("Could not touch brain-bootstrap sentinel %s: %s", sentinel, exc)
 
-    routed = (
-        "# Routed Brain Bootstrap (tier-1, always-load)\n\n"
-        "The configured brain bootstrap is the routing authority for user "
-        "context. Follow its routing instructions rather than loading brain "
-        "files implicitly.\n\n"
-        f"## {label}\n\n{scanned}"
-    )
-    return _truncate_content(
-        routed,
-        "brain bootstrap tier-1",
-        read_path=str(bootstrap),
-    )
+    return routed
 
 
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:

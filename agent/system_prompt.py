@@ -391,14 +391,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    memory_manager = getattr(agent, "_memory_manager", None)
-    if not (memory_manager and getattr(memory_manager, "providers", None)):
-        try:
-            tier_one_context = _r.load_user_context_tier1()
-            if tier_one_context:
-                stable_parts.append(tier_one_context)
-        except Exception:
-            pass
+    tier_one_context = _r.load_user_context_tier1()
+    if tier_one_context:
+        stable_parts.append(tier_one_context)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
